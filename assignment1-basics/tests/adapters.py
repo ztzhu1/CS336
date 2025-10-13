@@ -3,11 +3,17 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
+from pathlib import Path
+import sys
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from cs336_basics import bpe
 
 
 def run_linear(
@@ -589,4 +595,4 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    return bpe.train_bpe(input_path, vocab_size, special_tokens, **kwargs)
