@@ -39,7 +39,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
         bar.update(len(vocab))
         while len(vocab) < vocab_size and len(byte_pairs) > 0:
             freq_table, byte_pairs, pair_relations, merge_key = merge(
-                freq_table, byte_pairs, pair_relations, pool=None
+                freq_table, byte_pairs, pair_relations
             )
 
             assert merge_key not in vocab
@@ -55,7 +55,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
 def get_freq_table(args):
     chunk, special_tokens = args
     pattern = r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
-    special_tokens = [s.replace("|", "\|") for s in special_tokens]
+    special_tokens = [s.replace("|", r"\|") for s in special_tokens]
     pattern_split = "|".join(special_tokens)
     docs = re.split(pattern_split, chunk)
     freq_table = Counter()
@@ -84,51 +84,21 @@ def pair_bytes(freq_table, progress_bar=False):
     return byte_pairs, pair_relations
 
 
-def merge(freq_table, byte_pairs, pair_relations, pool=None):
+def merge(freq_table, byte_pairs, pair_relations):
     keys = np.array(list(byte_pairs))
     values = np.array(list(byte_pairs.values()))
     indexes = np.where(values == values.max())[0]
     max_keys = keys[indexes]
-    index = np.argmax(max_keys)
+    max_pairs = [pair_relations[k] for k in max_keys]
+    max_pair = max(max_pairs)
+    index = max_pairs.index(max_pair)
     merge_key = max_keys[index]
-    breakpoint()
-    merge_value = byte_pairs.pop(merge_key)
-    num_cpus = os.cpu_count()
-    chunk_size = len(freq_table) // num_cpus
-    keys = list(freq_table)
-    args = []
-    for i in range(num_cpus):
-        start = i * chunk_size
-        end = (i + 1) * chunk_size if i < num_cpus - 1 else len(freq_table)
-        args.append(
-            (
-                {k: freq_table[k] for k in keys[start:end]},
-                pair_relations,
-                merge_key,
-                merge_value,
-            )
-        )
-    freq_table = Counter()
-    if pool is None:
-        results = []
-        for arg in args:
-            results.append(merge_part(*arg))
-    else:
-        results = pool.starmap(merge_part, args)
-    for freq_table_part, delta_byte_pairs, delta_pair_relations in results:
-        freq_table.update(freq_table_part)
-        byte_pairs.update(delta_byte_pairs)
-        pair_relations.update(delta_pair_relations)
-    return freq_table, byte_pairs, pair_relations, merge_key
-
-
-def merge_part(freq_table, pair_relations, merge_key, merge_value):
-    new_freq_table = Counter()
-    delta_pair_relations = {}
-    delta_byte_pairs = Counter()
+    new_freq_table = {}
     for key in list(freq_table):
         new_key = []
         skip_next = False
+        merge_last = False
+        value = freq_table[key]
         for i in range(len(key)):
             if skip_next:
                 skip_next = False
@@ -140,26 +110,57 @@ def merge_part(freq_table, pair_relations, merge_key, merge_value):
             if pair == merge_key:
                 new_key.append(pair)
                 if i > 0:
-                    new_pair = key[i - 1] + pair
-                    if new_pair in pair_relations:
-                        assert pair_relations[new_pair] == (key[i - 1], pair)
+                    if not merge_last:
+                        byte_pairs[key[i - 1] + key[i]] -= value
+                        left = key[i - 1]
                     else:
-                        delta_pair_relations[new_pair] = (key[i - 1], pair)
-                    delta_byte_pairs[new_pair] += merge_value
+                        left = key[i - 2] + key[i - 1]
+                    new_pair = left + pair
+                    if new_pair in pair_relations:
+                        assert pair_relations[new_pair] == (left, pair)
+                    else:
+                        pair_relations[new_pair] = (left, pair)
+                    byte_pairs[new_pair] += value
                 if i < len(key) - 2:
-                    new_pair = pair + key[i + 2]
-                    if new_pair in pair_relations:
-                        assert pair_relations[new_pair] == (pair, key[i + 2])
+                    if i == len(key) - 3 or key[i + 2] + key[i + 3] != merge_key:
+                        merge_next = False
+                        right = key[i + 2]
                     else:
-                        delta_pair_relations[new_pair] = (pair, key[i + 2])
-                    delta_byte_pairs[new_pair] += merge_value
+                        merge_next = True
+                        right = key[i + 2] + key[i + 3]
+                    new_pair = pair + right
+
+                    byte_pairs[key[i + 1] + key[i + 2]] -= value
+                    if new_pair in pair_relations:
+                        assert pair_relations[new_pair] == (pair, right)
+                    else:
+                        pair_relations[new_pair] = (pair, right)
+                    if not merge_next:
+                        byte_pairs[new_pair] += value
+                    else:
+                        # this will be handled by next iteration
+                        pass
 
                 skip_next = True
+                merge_last = True
             else:
                 new_key.append(key[i])
                 skip_next = False
+                merge_last = False
         new_freq_table[tuple(new_key)] = freq_table[key]
-    return new_freq_table, delta_byte_pairs, delta_pair_relations
+    for key in list(byte_pairs):
+        if key == merge_key:
+            byte_pairs.pop(key)
+            continue
+        assert byte_pairs[key] >= 0
+        if byte_pairs[key] == 0:
+            byte_pairs.pop(key)
+    # print()
+    # print("count:", dict(byte_pairs), merge_key)
+    # print("old ft:", dict(freq_table))
+    # print("new ft:", dict(new_freq_table))
+    # print("--")
+    return new_freq_table, byte_pairs, pair_relations, merge_key
 
 
 def to_bytes_array(word: bytes):
