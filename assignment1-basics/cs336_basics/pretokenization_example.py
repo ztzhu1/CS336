@@ -51,7 +51,8 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
-def pretokenize(file_name, desired_num_chunks=4, return_first=False):
+def get_chunks(file_name, desired_num_chunks=4, return_first=False):
+    chunks = []
     with open(file_name, "rb") as f:
         boundaries = find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
 
@@ -60,8 +61,9 @@ def pretokenize(file_name, desired_num_chunks=4, return_first=False):
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore")
+            chunks.append(chunk)
             # Run pre-tokenization on your chunk and store the counts for each pre-token
             if return_first:
-                return chunk
-            print(len(chunk))
-            break
+                break
+
+    return chunks
