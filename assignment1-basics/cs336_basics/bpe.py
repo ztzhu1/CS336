@@ -1,8 +1,8 @@
 from collections import Counter
-import pickle
 from functools import partial
 from multiprocessing import Pool
 import os
+import pickle
 from typing import Iterable, Iterator, Optional
 
 import numpy as np
@@ -215,6 +215,10 @@ class Tokenizer:
         self.vocab = vocab
         self.merges = merges
         self.special_tokens = special_tokens if special_tokens else []
+        if len(self.special_tokens) > 0:
+            lengths = [len(s) for s in self.special_tokens]
+            indexes = np.argsort(lengths)[::-1]
+            self.special_tokens = [self.special_tokens[i] for i in indexes]
         for i in range(len(self.special_tokens)):
             special_token = self.special_tokens[i].encode("utf-8")
             if special_token not in vocab.values():
@@ -275,7 +279,27 @@ class Tokenizer:
         return [values.index(k) for k in word]
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        pass
+        ids = []
+        end = False
+        while not end or len(ids) > 0:
+            if len(ids) > 0:
+                yield ids.pop(0)
+            elif not end:
+                text = ""
+                while True:
+                    if any([text.endswith(s) for s in self.special_tokens]):
+                        break
+                    try:
+                        text += next(iterable)
+                    except StopIteration:
+                        end = True
+                        break
+                ids.extend(self.encode(text))
+                if len(ids) > 0:
+                    yield ids.pop(0)
 
     def decode(self, ids: list[int]) -> str:
-        pass
+        text = b""
+        for id in ids:
+            text += self.vocab[id]
+        return text.decode("utf-8", errors="replace")
