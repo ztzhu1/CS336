@@ -1,7 +1,9 @@
 from collections import Counter
+import pickle
 from functools import partial
 from multiprocessing import Pool
 import os
+from typing import Iterable, Iterator, Optional
 
 import numpy as np
 from tqdm import tqdm, trange
@@ -10,8 +12,17 @@ import regex as re
 
 from .pretokenization_example import get_chunks
 
+# ----- train bpe -----
+
 
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
+    """
+    It takes 3G memory, 11min (pretokenization 75 s, merging 585 s) to train TinyStoriesV2-GPT4-train.txt.
+    The longest tokens are ' accomplishment', ' disappointment' and ' responsibility'
+
+    It takes 100G memory, 11min (pretokenization 125 s, merging 585 s) to train owt_train.txt.
+    The longest tokens are
+    """
     chunks = get_chunks(input_path, desired_num_chunks=100)
     freq_table = Counter()
     num_cpus = os.cpu_count()
@@ -52,17 +63,43 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     return vocab, merges
 
 
-def get_freq_table(args):
+def split_special_tokens(text, special_tokens, return_special_tokens=False):
+    if len(special_tokens) == 0:
+        docs = [text]
+        it = None
+    else:
+        special_tokens = [s.replace("|", r"\|") for s in special_tokens]
+        pattern_split = "|".join(special_tokens)
+        docs = re.split(pattern_split, text)
+        if return_special_tokens:
+            it = re.finditer(pattern_split, text)
+    if return_special_tokens:
+        return docs, it
+    return docs
+
+
+def get_freq_table(args, return_words=False):
     chunk, special_tokens = args
     pattern = r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
-    special_tokens = [s.replace("|", r"\|") for s in special_tokens]
-    pattern_split = "|".join(special_tokens)
-    docs = re.split(pattern_split, chunk)
+    result = split_special_tokens(
+        chunk, special_tokens, return_special_tokens=return_words
+    )
     freq_table = Counter()
-    for doc in docs:
+    if return_words:
+        words = []
+        docs, special_tokens_iter = result
+    else:
+        docs = result
+    for i, doc in enumerate(docs):
         for word in re.finditer(pattern, doc):
             word = tuple(to_bytes_array(word[0].encode("utf-8")))
             freq_table[word] += 1
+            if return_words:
+                words.append(word)
+        if i != len(docs) - 1 and special_tokens_iter is not None:
+            words.append(next(special_tokens_iter)[0])
+    if return_words:
+        return freq_table, words
     return freq_table
 
 
@@ -165,3 +202,80 @@ def merge(freq_table, byte_pairs, pair_relations):
 
 def to_bytes_array(word: bytes):
     return [word[i : i + 1] for i in range(len(word))]
+
+
+# ----- encoding and decoding -----
+class Tokenizer:
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: Optional[list[str]] = None,
+    ):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens if special_tokens else []
+        for i in range(len(self.special_tokens)):
+            special_token = self.special_tokens[i].encode("utf-8")
+            if special_token not in vocab.values():
+                vocab[len(vocab)] = special_token
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: Optional[list[str]] = None,
+    ):
+        with open(vocab_filepath, "rb") as f:
+            result = pickle.load(f)
+        vocab = result["vocab"]
+        merges = result["merges"]
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        freq_table, words = get_freq_table(
+            (text, self.special_tokens), return_words=True
+        )
+        word_to_id = {}
+        for word in freq_table:
+            word_to_id[word] = self.word_to_id(word)
+        values = list(self.vocab.values())
+        for special_token in self.special_tokens:
+            word_to_id[special_token] = [values.index(special_token.encode("utf-8"))]
+        ids = []
+        for word in words:
+            ids.extend(word_to_id[word])
+        return ids
+
+    def word_to_id(self, word: list[bytes]) -> list[int]:
+        i = 256
+        N_vocab = len(self.vocab)
+        N_word = len(word)
+        while i < N_vocab and N_word > 1:
+            target = self.vocab[i]
+            for j in range(N_word - 1):
+                if target == word[j]:
+                    continue
+                if target.startswith(word[j]):
+                    substring = word[j]
+                    next = j + 1
+                    while next < len(word) and target.startswith(
+                        substring + word[next]
+                    ):
+                        substring += word[next]
+                        next += 1
+                    if substring == target:
+                        word = word[:j] + (substring,) + word[next:]
+                        N_word = len(word)
+                        i -= 1
+                        break
+            i += 1
+        values = list(self.vocab.values())
+        return [values.index(k) for k in word]
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        pass
+
+    def decode(self, ids: list[int]) -> str:
+        pass
