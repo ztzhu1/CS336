@@ -13,7 +13,7 @@ from torch import Tensor
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cs336_basics import bpe
+from cs336_basics import bpe, nn_336
 
 
 def run_linear(
@@ -34,8 +34,9 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    linear = nn_336.Linear(d_in, d_out, dtype=weights.dtype)
+    linear.load_state_dict({"weight": weights})
+    return linear(in_features)
 
 
 def run_embedding(
@@ -56,8 +57,9 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    embedding = nn_336.Embedding(vocab_size, d_model, dtype=weights.dtype)
+    embedding.load_state_dict({"weight": weights})
+    return embedding(token_ids)
 
 
 def run_swiglu(
@@ -458,7 +460,9 @@ def run_cross_entropy(
     raise NotImplementedError
 
 
-def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def run_gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
     Args:
