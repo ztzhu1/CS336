@@ -1,10 +1,8 @@
-from collections import OrderedDict
+import math
 
 import einops
 import torch
 from torch import nn
-
-import math
 
 
 class Linear(nn.Module):
