@@ -2,6 +2,8 @@ import einops
 import torch
 from torch import nn
 
+import math
+
 
 class Linear(nn.Module):
     def __init__(
@@ -134,3 +136,31 @@ class RoPE(nn.Module):
         x1 = torch.concat((-x[..., 1::2, None], x[..., ::2, None]), dim=-1)
         x1 = x1.reshape(*x.shape)
         return x * cos_theta + x1 * sin_theta
+
+
+def softmax(x: torch.Tensor, dim: int):
+    x = torch.exp(x - x.max(dim, keepdim=True)[0])
+    return x / x.sum(dim, keepdim=True)
+
+
+def scaled_dot_product_attention(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask=None
+):
+    """
+    Q, K: (batch_size, ..., seq_len, d_k)
+    V: (batch_size, ..., seq_len, d_v)
+    mask: (seq_len, seq_len)
+    """
+    d_k = K.shape[-1]
+    score_scaled = einops.einsum(
+        Q, K, "... seq_len_q d_k, ... seq_len_k d_k -> ... seq_len_q seq_len_k"
+    ) / math.sqrt(d_k)
+    if mask is not None:
+        score_scaled = score_scaled.masked_fill_(mask == False, float("-inf"))
+    attention_weight = softmax(score_scaled, -1)
+    attention = einops.einsum(
+        attention_weight,
+        V,
+        "... seq_len_q seq_len_k, ... seq_len_k d_v -> ... seq_len_q d_v",
+    )
+    return attention
