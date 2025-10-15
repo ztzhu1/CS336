@@ -91,7 +91,11 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    swiglu = nn_336.SwiGLU(d_model, d_ff, dtype=w1_weight.dtype)
+    swiglu.load_state_dict(
+        {"w1.weight": w1_weight, "w2.weight": w2_weight, "w3.weight": w3_weight}
+    )
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -208,7 +212,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = nn_336.RoPE(theta, d_k, max_seq_len)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -386,7 +391,9 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    norm = nn_336.RMSNorm(d_model, eps, dtype=weights.dtype)
+    norm.load_state_dict({"weight": weights})
+    return norm(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -400,7 +407,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return nn_336.SiLU()(in_features)
 
 
 def run_get_batch(
