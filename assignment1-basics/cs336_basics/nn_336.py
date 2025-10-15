@@ -131,33 +131,102 @@ class RoPE(nn.Module):
         """
         x: (..., seq_len, d_k)
         """
-        cos_theta = self.cos_theta[token_positions]  # (seq_len, d_k/2)
-        sin_theta = self.sin_theta[token_positions]  # (seq_len, d_k/2)
+        cos_theta = self.cos_theta[token_positions]  # (seq_len, d_k)
+        sin_theta = self.sin_theta[token_positions]  # (seq_len, d_k)
         x1 = torch.concat((-x[..., 1::2, None], x[..., ::2, None]), dim=-1)
         x1 = x1.reshape(*x.shape)
         return x * cos_theta + x1 * sin_theta
 
 
-def softmax(x: torch.Tensor, dim: int):
+class MultiheadSelfAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int = None,
+        Theta=None,
+        device=None,
+        dtype=None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = self.d_v = d_model // num_heads
+
+        self.weight = nn.Parameter(
+            torch.empty((3, num_heads, self.d_k, d_model), **factory_kwargs)
+        )  # store W_Q, W_K, W_V together
+        self.wo = Linear(num_heads * self.d_v, d_model, device=device, dtype=dtype)
+        if max_seq_len is not None:
+            self.rope = RoPE(Theta, self.d_k, max_seq_len)
+        else:
+            self.register_parameter("rope", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        std = 2.0 / sum(self.weight.shape[-2:])
+        nn.init.trunc_normal_(self.weight, mean=0, std=std, a=-3 * std, b=3 * std)
+
+    def forward(
+        self, x: torch.Tensor, token_positions: torch.Tensor = None
+    ) -> torch.Tensor:
+        seq_len = x.shape[-2]
+        QKV = einops.einsum(
+            x,
+            self.weight,
+            "... seq_len d_model, QKV num_heads d_k d_model -> ... QKV num_heads seq_len d_k",
+        )
+        QK = QKV[..., 0:2, :, :, :]  # (..., 2, num_heads, seq_len, d_k)
+        if self.rope is not None:
+            QK = self.rope(QK, token_positions)
+        Q = QK[..., 0, :, :, :]  # (..., num_heads, seq_len, d_k)
+        K = QK[..., 1, :, :, :]  # (..., num_heads, seq_len, d_k)
+        V = QKV[..., 2, :, :, :]  # (..., num_heads, seq_len, d_v)
+        mask = torch.tril(torch.ones((seq_len, seq_len), dtype=bool, device=x.device))
+        multi_head = scaled_dot_product_attention(
+            Q, K, V, mask
+        )  # (..., num_heads, seq_len, d_v)
+        multi_head = einops.rearrange(
+            # multi_head, "... num_heads seq_len d_v -> ... seq_len (num_heads d_v)"
+            multi_head,
+            "... num_heads seq_len d_v -> ... seq_len (num_heads d_v)",
+        )
+        a = self.wo(multi_head)
+        return a
+
+
+def softmax(x: torch.Tensor, dim: int, mask=None):
     x = torch.exp(x - x.max(dim, keepdim=True)[0])
-    return x / x.sum(dim, keepdim=True)
+    if mask is not None:
+        mask = ~mask
+        x = x.masked_fill_(mask, 0.0)
+    x = x / (x.sum(dim, keepdim=True))
+    if mask is not None:
+        x = x.masked_fill_(mask, 0.0)
+    return x
 
 
 def scaled_dot_product_attention(
     Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask=None
 ):
     """
-    Q, K: (batch_size, ..., seq_len, d_k)
-    V: (batch_size, ..., seq_len, d_v)
+    Parameters
+    ------
+    Q, K: (..., seq_len, d_k)
+    V: (..., seq_len, d_v)
     mask: (seq_len, seq_len)
+
+    Return
+    ------
+    attention: (..., seq_len, d_v)
     """
     d_k = K.shape[-1]
     score_scaled = einops.einsum(
         Q, K, "... seq_len_q d_k, ... seq_len_k d_k -> ... seq_len_q seq_len_k"
     ) / math.sqrt(d_k)
-    if mask is not None:
-        score_scaled = score_scaled.masked_fill_(mask == False, float("-inf"))
-    attention_weight = softmax(score_scaled, -1)
+    attention_weight = softmax(score_scaled, -1, mask=mask)
     attention = einops.einsum(
         attention_weight,
         V,

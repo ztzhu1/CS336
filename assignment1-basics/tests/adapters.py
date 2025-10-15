@@ -6,6 +6,7 @@ from typing import IO, Any, BinaryIO
 from pathlib import Path
 import sys
 
+import einops
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
@@ -150,7 +151,19 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    multi_head_self_attention = nn_336.MultiheadSelfAttention(
+        d_model, num_heads, dtype=q_proj_weight.dtype
+    )
+
+    pattern = "... (h d) d_in -> ... 1 h d d_in"
+    q_proj_weight = einops.rearrange(q_proj_weight, pattern, h=num_heads)
+    k_proj_weight = einops.rearrange(k_proj_weight, pattern, h=num_heads)
+    v_proj_weight = einops.rearrange(v_proj_weight, pattern, h=num_heads)
+    weight = torch.concat([q_proj_weight, k_proj_weight, v_proj_weight], dim=-4)
+    multi_head_self_attention.load_state_dict(
+        {"weight": weight, "wo.weight": o_proj_weight}
+    )
+    return multi_head_self_attention(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -190,8 +203,19 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    multi_head_self_attention = nn_336.MultiheadSelfAttention(
+        d_model, num_heads, max_seq_len, theta, dtype=q_proj_weight.dtype
+    )
 
+    pattern = "... (h d) d_in -> ... 1 h d d_in"
+    q_proj_weight = einops.rearrange(q_proj_weight, pattern, h=num_heads)
+    k_proj_weight = einops.rearrange(k_proj_weight, pattern, h=num_heads)
+    v_proj_weight = einops.rearrange(v_proj_weight, pattern, h=num_heads)
+    weight = torch.concat([q_proj_weight, k_proj_weight, v_proj_weight], dim=-4)
+    multi_head_self_attention.load_state_dict(
+        {"weight": weight, "wo.weight": o_proj_weight}
+    )
+    return multi_head_self_attention(in_features, token_positions)
 
 def run_rope(
     d_k: int,
