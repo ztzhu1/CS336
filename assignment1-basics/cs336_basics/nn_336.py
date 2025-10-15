@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import einops
 import torch
 from torch import nn
@@ -195,6 +197,84 @@ class MultiheadSelfAttention(nn.Module):
         )
         a = self.wo(multi_head)
         return a
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        d_ff,
+        max_seq_len=None,
+        Theta=None,
+        device=None,
+        dtype=None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+
+        self.norm1 = RMSNorm(d_model, **factory_kwargs)
+        self.multi_head = MultiheadSelfAttention(
+            d_model, num_heads, max_seq_len, Theta, **factory_kwargs
+        )
+        self.ffn = SwiGLU(d_model, d_ff, **factory_kwargs)
+        self.norm2 = RMSNorm(d_model, **factory_kwargs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.multi_head.rope is not None:
+            token_positions = torch.arange(
+                x.shape[-2], device=x.device, dtype=torch.long
+            )
+        else:
+            token_positions = None
+        a = self.multi_head(self.norm1(x), token_positions)
+        x = x + a
+        a = self.ffn(self.norm2(x))
+        x = x + a
+        return x
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        num_layers,
+        d_model,
+        num_heads,
+        d_ff,
+        max_seq_len=None,
+        Theta=None,
+        device=None,
+        dtype=None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.token_embeddings = Embedding(vocab_size, d_model, **factory_kwargs)
+        layers = []
+        for _ in range(num_layers):
+            layers.append(
+                TransformerBlock(
+                    d_model,
+                    num_heads,
+                    d_ff,
+                    max_seq_len,
+                    Theta,
+                    **factory_kwargs,
+                )
+            )
+        self.layers = nn.Sequential(*layers)
+        self.ln_final = RMSNorm(d_model, **factory_kwargs)
+        self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.token_embeddings(x)
+        x = self.layers(x)
+        x = self.ln_final(x)
+        x = self.lm_head(x)
+        return x
 
 
 def softmax(x: torch.Tensor, dim: int, mask=None):

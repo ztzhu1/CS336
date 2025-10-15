@@ -217,6 +217,7 @@ def run_multihead_self_attention_with_rope(
     )
     return multi_head_self_attention(in_features, token_positions)
 
+
 def run_rope(
     d_k: int,
     theta: float,
@@ -310,7 +311,29 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    block = nn_336.TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta)
+
+    q_proj_weight = weights["attn.q_proj.weight"]
+    k_proj_weight = weights["attn.k_proj.weight"]
+    v_proj_weight = weights["attn.v_proj.weight"]
+    o_proj_weight = weights["attn.output_proj.weight"]
+    pattern = "... (h d) d_in -> ... 1 h d d_in"
+    q_proj_weight = einops.rearrange(q_proj_weight, pattern, h=num_heads)
+    k_proj_weight = einops.rearrange(k_proj_weight, pattern, h=num_heads)
+    v_proj_weight = einops.rearrange(v_proj_weight, pattern, h=num_heads)
+    weight = torch.concat([q_proj_weight, k_proj_weight, v_proj_weight], dim=-4)
+    block.load_state_dict(
+        {
+            "multi_head.weight": weight,
+            "multi_head.wo.weight": o_proj_weight,
+            "norm1.weight": weights["ln1.weight"],
+            "ffn.w1.weight": weights["ffn.w1.weight"],
+            "ffn.w2.weight": weights["ffn.w2.weight"],
+            "ffn.w3.weight": weights["ffn.w3.weight"],
+            "norm2.weight": weights["ln2.weight"],
+        }
+    )
+    return block(in_features)
 
 
 def run_transformer_lm(
@@ -392,7 +415,35 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer = nn_336.TransformerLM(
+        vocab_size, num_layers, d_model, num_heads, d_ff, context_length, rope_theta
+    )
+    state_dict = {}
+    for key in ["token_embeddings", "ln_final", "lm_head"]:
+        state_dict[f"{key}.weight"] = weights[f"{key}.weight"]
+    for i in range(num_layers):
+        q_proj_weight = weights[f"layers.{i}.attn.q_proj.weight"]
+        k_proj_weight = weights[f"layers.{i}.attn.k_proj.weight"]
+        v_proj_weight = weights[f"layers.{i}.attn.v_proj.weight"]
+        o_proj_weight = weights[f"layers.{i}.attn.output_proj.weight"]
+        pattern = "... (h d) d_in -> ... 1 h d d_in"
+        q_proj_weight = einops.rearrange(q_proj_weight, pattern, h=num_heads)
+        k_proj_weight = einops.rearrange(k_proj_weight, pattern, h=num_heads)
+        v_proj_weight = einops.rearrange(v_proj_weight, pattern, h=num_heads)
+        weight = torch.concat([q_proj_weight, k_proj_weight, v_proj_weight], dim=-4)
+        state_dict.update(
+            {
+                f"layers.{i}.multi_head.weight": weight,
+                f"layers.{i}.multi_head.wo.weight": o_proj_weight,
+                f"layers.{i}.norm1.weight": weights[f"layers.{i}.ln1.weight"],
+                f"layers.{i}.ffn.w1.weight": weights[f"layers.{i}.ffn.w1.weight"],
+                f"layers.{i}.ffn.w2.weight": weights[f"layers.{i}.ffn.w2.weight"],
+                f"layers.{i}.ffn.w3.weight": weights[f"layers.{i}.ffn.w3.weight"],
+                f"layers.{i}.norm2.weight": weights[f"layers.{i}.ln2.weight"],
+            }
+        )
+    transformer.load_state_dict(state_dict)
+    return transformer(in_indices)
 
 
 def run_rmsnorm(
