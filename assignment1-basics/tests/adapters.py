@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+import os
 from pathlib import Path
 import sys
+from typing import IO, Any, BinaryIO
 
 import einops
 import numpy.typing as npt
 import torch
-from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+from jaxtyping import Bool, Float, Int
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cs336_basics import bpe, nn_336
+from cs336_basics import bpe, nn_336, train
 
 
 def run_linear(
@@ -539,7 +540,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return train.cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(
@@ -553,14 +554,14 @@ def run_gradient_clipping(
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    train.gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return train.AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -588,7 +589,9 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return train.get_lr_cosine_schedule(
+        it, (min_learning_rate, max_learning_rate), warmup_iters, cosine_cycle_iters
+    )
 
 
 def run_save_checkpoint(
