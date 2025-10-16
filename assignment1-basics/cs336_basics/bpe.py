@@ -15,7 +15,7 @@ from .pretokenization_example import get_chunks
 # ----- train bpe -----
 
 
-def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
+def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], cpp=1):
     """
     It takes 3G memory, 11min (pretokenization 75 s, merging 585 s) to train TinyStoriesV2-GPT4-train.txt.
     The longest tokens are ' accomplishment', ' disappointment' and ' responsibility'
@@ -26,6 +26,11 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     chunks = get_chunks(input_path, desired_num_chunks=100)
     freq_table = Counter()
     num_cpus = os.cpu_count()
+    if cpp:
+        breakpoint()
+        merge_func = merge_cpp
+    else:
+        merge_func = merge
     # pretokenization
     with Pool(processes=num_cpus) as pool:
         args = []
@@ -49,7 +54,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
         bar = tqdm(total=vocab_size, desc="merging")
         bar.update(len(vocab))
         while len(vocab) < vocab_size and len(byte_pairs) > 0:
-            freq_table, byte_pairs, pair_relations, merge_key = merge(
+            freq_table, byte_pairs, pair_relations, merge_key = merge_func(
                 freq_table, byte_pairs, pair_relations
             )
 
@@ -197,6 +202,38 @@ def merge(freq_table, byte_pairs, pair_relations):
     # print("old ft:", dict(freq_table))
     # print("new ft:", dict(new_freq_table))
     # print("--")
+    return new_freq_table, byte_pairs, pair_relations, merge_key
+
+
+def merge_cpp(freq_table, byte_pairs, pair_relations):
+    from . import merge_vocab
+
+    keys = np.array(list(byte_pairs))
+    values = np.array(list(byte_pairs.values()))
+    indexes = np.where(values == values.max())[0]
+    max_keys = keys[indexes]
+    max_pairs = [pair_relations[k] for k in max_keys]
+    max_pair = max(max_pairs)
+    index = max_pairs.index(max_pair)
+    merge_key = max_keys[index]
+    new_freq_table = {}
+
+    merge_vocab.merge(
+        freq_table,
+        new_freq_table,
+        byte_pairs,
+        pair_relations,
+        merge_key,
+        len(freq_table),
+    )
+
+    for key in list(byte_pairs):
+        if key == merge_key:
+            byte_pairs.pop(key)
+            continue
+        assert byte_pairs[key] >= 0
+        if byte_pairs[key] == 0:
+            byte_pairs.pop(key)
     return new_freq_table, byte_pairs, pair_relations, merge_key
 
 
