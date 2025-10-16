@@ -15,7 +15,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
 # headers
 include_directories(
     # /home/ztzhu/.conda/envs/exp/bin/python
-    /home/ztzhu/.conda/envs/exp/lib/python3.9/site-packages/pybind11/include
+    /home/ztzhu/AI/CS336/assignment1-basics/.venv/lib/python3.12/site-packages/pybind11/include
     /home/ztzhu/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/include/python3.12
     # ${CMAKE_SOURCE_DIR}/third_party/fmt/include
 )
@@ -33,7 +33,7 @@ set(
 add_library(${PROJECT_NAME} SHARED ${SRC_LIST})
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
-    /home/ztzhu/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/bin/python3.12
+    # /home/ztzhu/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/bin/python3.12
 )
 set_target_properties(
     ${PROJECT_NAME} PROPERTIES

@@ -15,7 +15,7 @@ from .pretokenization_example import get_chunks
 # ----- train bpe -----
 
 
-def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], cpp=1):
+def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], cpp=False):
     """
     It takes 3G memory, 11min (pretokenization 75 s, merging 585 s) to train TinyStoriesV2-GPT4-train.txt.
     The longest tokens are ' accomplishment', ' disappointment' and ' responsibility'
@@ -27,7 +27,6 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], cpp=1
     freq_table = Counter()
     num_cpus = os.cpu_count()
     if cpp:
-        breakpoint()
         merge_func = merge_cpp
     else:
         merge_func = merge
@@ -95,6 +94,7 @@ def get_freq_table(args, return_words=False):
         docs, special_tokens_iter = result
     else:
         docs = result
+        special_tokens_iter = None
     for i, doc in enumerate(docs):
         for word in re.finditer(pattern, doc):
             word = tuple(to_bytes_array(word[0].encode("utf-8")))
