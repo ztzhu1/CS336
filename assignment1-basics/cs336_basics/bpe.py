@@ -17,10 +17,10 @@ from .pretokenization_example import get_chunks
 
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], cpp=False):
     """
-    It takes 3G memory, 11min (pretokenization 75 s, merging 585 s) to train TinyStoriesV2-GPT4-train.txt.
+    It takes 3G memory, 7 min (pretokenization 76 s, merging 340 s) to train TinyStoriesV2-GPT4-train.txt.
     The longest tokens are ' accomplishment', ' disappointment' and ' responsibility'
 
-    It takes 100G memory, 11min (pretokenization 125 s, merging 585 s) to train owt_train.txt.
+    It takes 100G memory, 70 h (pretokenization 2 min, merging 70 h) to train owt_train.txt.
     The longest tokens are
     """
     chunks = get_chunks(input_path, desired_num_chunks=100)
@@ -141,6 +141,10 @@ def merge(freq_table, byte_pairs, pair_relations):
         skip_next = False
         merge_last = False
         value = freq_table[key]
+        joined_key = b"".join(key)
+        if merge_key not in joined_key:
+            new_freq_table[key] = freq_table[key]
+            continue
         for i in range(len(key)):
             if skip_next:
                 skip_next = False
