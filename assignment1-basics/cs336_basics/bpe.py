@@ -319,9 +319,13 @@ class Tokenizer:
         values = list(self.vocab.values())
         return [values.index(k) for k in word]
 
-    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+    def encode_iterable(
+        self, iterable: Iterable[str], total_size=None
+    ) -> Iterator[int]:
         ids = []
         end = False
+        if total_size is not None:
+            bar = tqdm(total=total_size)
         while not end or len(ids) > 0:
             if len(ids) > 0:
                 yield ids.pop(0)
@@ -336,8 +340,12 @@ class Tokenizer:
                         end = True
                         break
                 ids.extend(self.encode(text))
+                if total_size is not None:
+                    bar.update(len(text))
                 if len(ids) > 0:
                     yield ids.pop(0)
+        if total_size is not None:
+            bar.close()
 
     def decode(self, ids: list[int]) -> str:
         text = b""

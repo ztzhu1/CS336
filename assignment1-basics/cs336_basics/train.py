@@ -1,9 +1,16 @@
 import math
+import os
+from pathlib import Path
+from typing import IO, BinaryIO, Union
 
 import einops
+import numpy as np
 import torch
 from torch import nn
 from torch.optim import Optimizer
+from tqdm import tqdm, trange
+
+from . import nn_336
 
 
 def cross_entropy(inputs, targets):
@@ -83,3 +90,84 @@ def gradient_clipping(parameters, max_l2_norm):
             if p.grad is None:
                 continue
             p.grad.data *= clip_coef
+
+
+def get_batch(x: np.ndarray, batch_size: int, context_length: int, device: str):
+    pass
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: Optimizer,
+    iteration: int,
+    out: Union[str, os.PathLike, BinaryIO, IO[bytes]],
+):
+    obj = {
+        "model_state_dict": model.state_dict(),
+        "opt_state_dict": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(obj, out)
+
+
+def load_checkpoint(
+    src: Union[str, os.PathLike, BinaryIO, IO[bytes]],
+    model: nn.Module,
+    optimizer: Optimizer,
+):
+    obj = torch.load(src)
+    model.load_state_dict(obj["model_state_dict"])
+    optimizer.load_state_dict(obj["opt_state_dict"])
+    iteration = obj["iteration"]
+    return iteration
+
+
+def load_data(x, batch_size, context_length, device):
+    N = len(x)
+    max_index = N - context_length - 1
+    assert max_index >= 0
+    indexes = np.random.randint(0, max_index + 1, (batch_size,))[:, None]
+    offset = np.arange(context_length)
+    indexes = indexes + offset
+    seq1 = torch.LongTensor(x[indexes], device=device)
+    seq2 = torch.LongTensor(x[indexes + 1], device=device)
+    return seq1, seq2
+
+
+def train(
+    epochs, batch_size, model_kwargs, opt_kwargs, checkpoint_dir=None, save_every=10
+):
+    model = nn_336.TransformerLM(**model_kwargs)
+    optimizer = AdamW(model.parameters(), **opt_kwargs)
+    losses = []
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for epoch in trange(epochs):
+        epoch += 1
+        running_loss = 0.0
+        batch_progress = tqdm(dataloader, desc="Batches", leave=False)
+
+        for iter, (images, labels) in enumerate(batch_progress):
+            images = images.to(device)
+            tgt = images.clone()
+            pred = model(images)
+            loss = bce(pred, tgt)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+            losses.append(loss.item())
+        avg_loss = running_loss * batch_size / len(train_dataset)
+        if epoch % save_every == 0 and checkpoint_dir is not None:
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch,
+                (checkpoint_dir / f"checkpoint_epoch_{epoch}.pt").as_posix(),
+            )
+
+        tqdm.write(f"----\nEpoch [{epoch}/{epochs}], Average Loss: {avg_loss:.4f}\n")

@@ -3,6 +3,7 @@ import math
 import einops
 import torch
 from torch import nn
+from tqdm import tqdm, trange
 
 
 class Linear(nn.Module):
@@ -273,6 +274,51 @@ class TransformerLM(nn.Module):
         x = self.ln_final(x)
         x = self.lm_head(x)
         return x
+
+    @torch.inference_mode()
+    def decode(
+        self,
+        x: torch.Tensor,
+        vocab: dict[int, bytes],
+        max_token_num=float("inf"),
+        tau=0.1,
+        top_p=0.9,
+        progress_bar=True,
+    ) -> str:
+        """
+        x: (..., seq_len)
+        """
+        ids = []
+        assert x.ndim == 1  # TODO
+        if progress_bar:
+            it = trange(max_token_num)
+        else:
+            it = range(max_token_num)
+        for _ in it:
+            logits = self(x)  # (..., seq_len, vocab_size)
+            logits = logits[..., -1:, :]  # (..., 1, vocab_size)
+            probs = softmax(logits / tau, dim=-1)
+            sorted_probs, sorted_indexes = torch.sort(probs, dim=-1, descending=True)
+            cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+            sorted_indices_to_remove = cumsum_probs >= top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                ..., :-1
+            ].clone()
+            sorted_indices_to_remove[..., 0] = False
+            sorted_probs[sorted_indices_to_remove] = 0.0
+            # sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True) # unnecessary since torch.multinomial handles that
+            probs = torch.gather(sorted_probs, -1, sorted_indexes.argsort(-1))
+            shape = probs.shape
+            output = torch.multinomial(probs.view(-1, shape[-1]), 1).view(shape[:-1])
+            x = torch.cat([x, output], dim=-1)
+            ids.append(output.item())
+
+            if vocab[ids[-1]] == b"<|endoftext|>":
+                break
+        text = b""
+        for id in ids:
+            text += vocab[id]
+        return text.decode("utf-8", errors="replace")
 
 
 def softmax(x: torch.Tensor, dim: int, mask=None):
