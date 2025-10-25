@@ -15,7 +15,7 @@ from . import nn_336
 
 def cross_entropy(inputs, targets):
     """
-    inputs (Float[Tensor, "batch_size vocab_size"])
+    inputs (Float[Tensor, "batch_size vocab_size"]), logits
     targets (Int[Tensor, "batch_size"])
     """
     max_x = inputs.max(-1, keepdim=True)[0]
@@ -28,10 +28,18 @@ def cross_entropy(inputs, targets):
 
 class AdamW(Optimizer):
     def __init__(
-        self, params, lr=0.01, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2
+        self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2
     ):
-        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "weight_decay": weight_decay,
+        }
         super().__init__(params, defaults)
+        self.state["epoch"] = 0
+        self.state["losses"] = []
+        self.state["init_lr"] = lr
 
     def step(self, closure=None):
         loss = None if closure is None else closure()
@@ -61,6 +69,7 @@ class AdamW(Optimizer):
                 p.data -= lr * weight_decay * p.data
                 state["t"] = t + 1
 
+        self.state["epoch"] += 1
         return loss
 
 
@@ -90,10 +99,6 @@ def gradient_clipping(parameters, max_l2_norm):
             if p.grad is None:
                 continue
             p.grad.data *= clip_coef
-
-
-def get_batch(x: np.ndarray, batch_size: int, context_length: int, device: str):
-    pass
 
 
 def save_checkpoint(
@@ -129,45 +134,6 @@ def load_data(x, batch_size, context_length, device):
     indexes = np.random.randint(0, max_index + 1, (batch_size,))[:, None]
     offset = np.arange(context_length)
     indexes = indexes + offset
-    seq1 = torch.LongTensor(x[indexes], device=device)
-    seq2 = torch.LongTensor(x[indexes + 1], device=device)
+    seq1 = torch.LongTensor(x[indexes]).to(device)
+    seq2 = torch.LongTensor(x[indexes + 1]).to(device)
     return seq1, seq2
-
-
-def train(
-    epochs, batch_size, model_kwargs, opt_kwargs, checkpoint_dir=None, save_every=10
-):
-    model = nn_336.TransformerLM(**model_kwargs)
-    optimizer = AdamW(model.parameters(), **opt_kwargs)
-    losses = []
-    if checkpoint_dir is not None:
-        checkpoint_dir = Path(checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    for epoch in trange(epochs):
-        epoch += 1
-        running_loss = 0.0
-        batch_progress = tqdm(dataloader, desc="Batches", leave=False)
-
-        for iter, (images, labels) in enumerate(batch_progress):
-            images = images.to(device)
-            tgt = images.clone()
-            pred = model(images)
-            loss = bce(pred, tgt)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-
-            losses.append(loss.item())
-        avg_loss = running_loss * batch_size / len(train_dataset)
-        if epoch % save_every == 0 and checkpoint_dir is not None:
-            save_checkpoint(
-                model,
-                optimizer,
-                epoch,
-                (checkpoint_dir / f"checkpoint_epoch_{epoch}.pt").as_posix(),
-            )
-
-        tqdm.write(f"----\nEpoch [{epoch}/{epochs}], Average Loss: {avg_loss:.4f}\n")

@@ -161,7 +161,7 @@ class MultiheadSelfAttention(nn.Module):
         )  # store W_Q, W_K, W_V together
         self.wo = Linear(num_heads * self.d_v, d_model, device=device, dtype=dtype)
         if max_seq_len is not None:
-            self.rope = RoPE(Theta, self.d_k, max_seq_len)
+            self.rope = RoPE(Theta, self.d_k, max_seq_len, device=device)
         else:
             self.register_parameter("rope", None)
         self.reset_parameters()
@@ -251,7 +251,13 @@ class TransformerLM(nn.Module):
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        self.vocab_size = vocab_size
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
         self.token_embeddings = Embedding(vocab_size, d_model, **factory_kwargs)
+        self.max_seq_len = max_seq_len
         layers = []
         for _ in range(num_layers):
             layers.append(
@@ -320,15 +326,59 @@ class TransformerLM(nn.Module):
             text += vocab[id]
         return text.decode("utf-8", errors="replace")
 
+    def get_num_params(
+        self,
+        vocab_size=None,
+        d_model=None,
+        d_ff=None,
+        num_layers=None,
+        num_heads=None,
+        max_seq_len=None,
+    ) -> int:
+        v = vocab_size or self.vocab_size
+        d_m = d_model or self.d_model
+        d_ff = d_ff or self.d_ff
+        n = num_layers or self.num_layers
+        h = num_heads or self.num_heads
+        c = max_seq_len or self.max_seq_len
+        k = d_ff / d_m
+        d_v = d_m // h
+        p_embedding = v * d_m
+        p_norm = d_m
+        p_transformer_block = (
+            2 * p_norm + h * (3 * d_v * d_m) + h * d_v * d_m + 3 * d_ff * d_m
+        )
+        p_linear = v * d_m
+        num_trainable_params = p_embedding + n * p_transformer_block + p_linear + p_norm
+        num_trainable_params_reduced = (2 * v + 2 * n + 1) * d_m + n * (
+            4 + 3 * k
+        ) * d_m**2
+        assert num_trainable_params == num_trainable_params_reduced
+        num_non_trainable_params = 2 * c * (d_m // h)  # if all blocks share one RoPE
+        num_params = num_trainable_params + num_non_trainable_params
+        # return num_params
+        return num_trainable_params
+
+    def get_flops(
+        self,
+        vocab_size=None,
+        d_model=None,
+        d_ff=None,
+        num_layers=None,
+        num_heads=None,
+        max_seq_len=None,
+    ) -> int:
+        raise NotImplementedError()
+
 
 def softmax(x: torch.Tensor, dim: int, mask=None):
     x = torch.exp(x - x.max(dim, keepdim=True)[0])
     if mask is not None:
         mask = ~mask
-        x = x.masked_fill_(mask, 0.0)
+        x = x.masked_fill(mask, 0.0)
     x = x / (x.sum(dim, keepdim=True))
     if mask is not None:
-        x = x.masked_fill_(mask, 0.0)
+        x = x.masked_fill(mask, 0.0)
     return x
 
 
