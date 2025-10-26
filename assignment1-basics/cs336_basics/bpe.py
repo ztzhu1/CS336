@@ -21,7 +21,6 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], cpp=F
     The longest tokens are ' accomplishment', ' disappointment' and ' responsibility'
 
     It takes 100G memory, 70 h (pretokenization 2 min, merging 70 h) to train owt_train.txt.
-    The longest tokens are
     """
     chunks = get_chunks(input_path, desired_num_chunks=100)
     freq_table = Counter()
