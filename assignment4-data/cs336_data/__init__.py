@@ -1,3 +1,3 @@
 import importlib.metadata
 
-__version__ = importlib.metadata.version("cs336-data")
+__version__ = "1.0.4"
