@@ -379,7 +379,6 @@ class FlashAttentionTorch(torch.autograd.Function):
         assert V.shape[-1] == d
         Tq = cdiv(Nq, Bq)
         Tk = cdiv(Nk, Bk)
-        ctx.save_for_backward(Q, K, V)
         ctx.Bq = Bq
         ctx.Bk = Bk
         ctx.d = d
@@ -401,6 +400,16 @@ class FlashAttentionTorch(torch.autograd.Function):
                 Sij = einops.einsum(
                     Qi, Kj, "... Bq d, ... Bk d -> ... Bq Bk"
                 ) / math.sqrt(d)
+                if is_causal:
+                    mask = (
+                        torch.arange(i * Bq, min((i + 1) * Bq, Nq), device=Q.device)[
+                            :, None
+                        ]
+                        >= torch.arange(j * Bk, min((j + 1) * Bk, Nk), device=Q.device)[
+                            None, :
+                        ]
+                    )
+                    Sij = torch.where(mask, Sij, -1e6)
                 new_mi = torch.max(mi, Sij.max(-1, keepdims=True)[0])  # (..., Bq, 1)
                 Pij = torch.exp(Sij - new_mi)  # (..., Bq, Bk)
                 exp_diff = torch.exp(mi - new_mi)
@@ -413,12 +422,21 @@ class FlashAttentionTorch(torch.autograd.Function):
             Li = mi + torch.log(li)  # (..., Bq, 1)
             O[..., i * Bq : (i + 1) * Bq, :] = Oi
             L[..., i * Bq : (i + 1) * Bq] = Li[..., 0]
-        ctx.save_for_backward(O, L)
+        ctx.save_for_backward(Q, K, V, O, L)
         return O
 
     @staticmethod
-    def backward(ctx, grad_out):
-        raise NotImplementedError()
+    def backward(ctx, dO):
+        Q, K, V, O, L = ctx.saved_tensors
+        d = Q.shape[-1]
+        S = einops.einsum(Q, K, "... Nq d, ... Nk d -> ... Nq Nk") / math.sqrt(d)
+        P = torch.exp(S - L[..., None])  # (..., Nq, Nk)
+        dV = einops.einsum(P, dO, "... Nq Nk, ... Nq d -> ... Nk d")
+        dP = einops.einsum(dO, V, "... Nq d, ... Nk d -> ... Nq Nk")
+        dS = P * (dP - (O * dO).sum(-1, keepdims=True))
+        dQ = einops.einsum(dS, K, "... Nq Nk, ... Nk d -> ... Nq d") / math.sqrt(d)
+        dK = einops.einsum(dS, Q, "... Nq Nk, ... Nq d -> ... Nk d") / math.sqrt(d)
+        return dQ, dK, dV, None
 
 
 @triton.jit
@@ -448,6 +466,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -510,6 +529,11 @@ def flash_fwd_kernel(
         )  # (Bk, d)
 
         Sij = tl.dot(Qi, Kj.T) * scale  # (Bq, Bk)
+        if is_causal:
+            mask = (tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE).reshape(
+                Q_TILE_SIZE, 1
+            ) >= (tl.arange(0, K_TILE_SIZE) + j * K_TILE_SIZE)
+            Sij = tl.where(mask, Sij, -1e6)
         Sij_max = tl.max(Sij, -1)
         new_mi = tl.where(mi >= Sij_max, mi, Sij_max)  # (Bq, )
         Pij = tl.exp(Sij.T - new_mi).T  # (Bq, Bk)
@@ -580,6 +604,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             d,
             Bq,
             Bk,
+            is_causal,
         )
         ctx.save_for_backward(O, L)
         return O
