@@ -27,25 +27,25 @@ def run_mask_ips(text: str) -> tuple[str, int]:
 
 
 def run_classify_nsfw(text: str) -> tuple[Any, float]:
-    raise NotImplementedError
+    return process_cc.classify_nsfw(text)
 
 
 def run_classify_toxic_speech(text: str) -> tuple[Any, float]:
-    raise NotImplementedError
+    return process_cc.classify_toxic_speech(text)
 
 
 def run_classify_quality(text: str) -> tuple[Any, float]:
-    raise NotImplementedError
+    return process_cc.classify_quality(text)
 
 
 def run_gopher_quality_filter(text: str) -> bool:
-    raise NotImplementedError
+    return process_cc.gopher_quality_filter(text)
 
 
 def run_exact_line_deduplication(
     input_files: list[os.PathLike], output_directory: os.PathLike
 ):
-    raise NotImplementedError
+    return process_cc.exact_line_deduplication(input_files, output_directory)
 
 
 def run_minhash_deduplication(
@@ -56,4 +56,6 @@ def run_minhash_deduplication(
     jaccard_threshold: float,
     output_directory: os.PathLike,
 ):
-    raise NotImplementedError
+    return process_cc.minhash_deduplication(
+        input_files, num_hashes, num_bands, ngrams, jaccard_threshold, output_directory
+    )
