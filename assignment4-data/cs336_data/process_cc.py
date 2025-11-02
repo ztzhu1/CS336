@@ -4,9 +4,9 @@ import os
 from pathlib import Path
 import re
 import sys
-
 import string
 import unicodedata
+
 
 project_dir = Path(__file__).parent.parent
 project_path = project_dir.as_posix()

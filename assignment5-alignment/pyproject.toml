@@ -30,8 +30,8 @@ package = true
 no-build-isolation-package = ["flash-attn"]
 
 
-[tool.uv.sources]
-alpaca-eval = { git = "https://github.com/nelson-liu/alpaca_eval.git", rev = "forward_kwargs_to_vllm" }
+# [tool.uv.sources]
+# alpaca-eval = { git = "https://github.com/nelson-liu/alpaca_eval.git", rev = "forward_kwargs_to_vllm" }
 
 [tool.pytest.ini_options]
 log_cli = true
@@ -41,3 +41,7 @@ log_cli_level = "WARNING"
 name = "flash-attn"
 version = "2.7.4.post1"
 requires-dist = ["torch", "einops", "setuptools"]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
