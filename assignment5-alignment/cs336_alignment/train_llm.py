@@ -7,6 +7,7 @@ from typing import Callable, List, Union
 from openai import OpenAI
 import pandas as pd
 from tqdm.auto import trange
+from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
 from vllm import LLM, SamplingParams
 
 from cs336_alignment import drgrpo_grader
@@ -21,6 +22,16 @@ with open(project_dir / "cs336_alignment" / "prompts" / "r1_zero.prompt", "r") a
 
 with open(project_dir / "api_keys.json", "r") as f:
     api_keys = json.load(f)
+
+
+def load_sft():
+    path = project_dir.joinpath("data", "MATH", "sft.jsonl")
+    sft_data = pd.read_json(
+        path_or_buf=path,
+        lines=True,
+        dtype={"data_type": str, "data_index": int, "prompt": str, "response": str},
+    )
+    return sft_data
 
 
 def make_prompt(
@@ -42,12 +53,7 @@ def make_sft_dataset(batch_size=1, indexes=None):
     with open(project_dir / "data" / "MATH" / "annot_CoT_prompt_en_v2.txt", "r") as f:
         pre_prompt = f.read()
 
-    path = project_dir.joinpath("data", "MATH", "sft.jsonl")
-    sft_data = pd.read_json(
-        path_or_buf=path,
-        lines=True,
-        dtype={"data_type": str, "data_index": int, "prompt": str, "response": str},
-    )
+    sft_data = load_sft()
 
     if len(sft_data) == 0:
         sft_data = pd.DataFrame(
@@ -95,6 +101,7 @@ def make_sft_dataset(batch_size=1, indexes=None):
             "prompt": prompt,
             "response": response,
         }
+    path = project_dir.joinpath("data", "MATH", "sft.jsonl")
     # sft_data.to_json(path, lines=True, orient="records")
     save_jsonl(sft_data.to_dict(orient="records"), path, overwrite=True)
 
@@ -203,3 +210,26 @@ def load_zero_shot_baseline():
     path = project_dir.joinpath("evaluation", "zero_baseline.jsonl")
     data = pd.read_json(path_or_buf=path, lines=True)
     return data
+
+
+def encode2(tokenizer: PreTrainedTokenizerBase):
+    sft_data = load_sft()
+    prompts = list(sft_data.prompt)
+    responses = list(sft_data.response)
+    return tokenize_prompt_and_output(make_prompt(prompts), responses, tokenizer)
+
+
+def tokenize_prompt_and_output(
+    prompt_strs, output_strs, tokenizer: PreTrainedTokenizerBase
+):
+    batch_encoding = tokenizer.batch_encode_plus(
+        [(prompt_strs[i], output_strs[i]) for i in range(len(prompt_strs))],
+        padding=True,
+        return_token_type_ids=1,
+        return_tensors="pt",
+    )
+    input_ids = batch_encoding["input_ids"]  # (batch_size, max_seq_len)
+    labels = input_ids[:, 1:].clone()  # (batch_size, max_seq_len-1)
+    input_ids = input_ids[:, :-1]  # (batch_size, max_seq_len-1)
+    response_mask = batch_encoding["token_type_ids"].bool()[:, 1:]
+    return {"input_ids": input_ids, "labels": labels, "response_mask": response_mask}
