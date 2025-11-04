@@ -168,3 +168,4 @@ cython_debug/
 #.idea/
 
 api_keys.json
+wandb/
