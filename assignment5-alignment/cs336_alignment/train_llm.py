@@ -10,6 +10,9 @@ import numpy as np
 from openai import OpenAI
 import pandas as pd
 import torch
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm, trange
 from transformers import (
     AutoModelForCausalLM,
@@ -116,7 +119,7 @@ def make_sft_dataset(batch_size=1, indexes=None):
     save_jsonl(sft_data.to_dict(orient="records"), path, overwrite=True)
 
 
-def check_sft_dataset():
+def check_sft_dataset(fast=False):
     path = project_dir.joinpath("data", "MATH", "train.jsonl")
     data = pd.read_json(path_or_buf=path, lines=True)
 
@@ -130,7 +133,7 @@ def check_sft_dataset():
     for i in range(len(sft_data)):
         index = sft_data.iloc[i].data_index.item()
         reward = drgrpo_grader.r1_zero_reward_fn(
-            sft_data.iloc[i].response, data.iloc[index].solution
+            sft_data.iloc[i].response, data.iloc[index].solution, fast=fast
         )
         if reward["reward"] != 1:
             rewards[index] = reward
@@ -233,7 +236,7 @@ def encode2(tokenizer: PreTrainedTokenizerBase):
 
 
 def tokenize_prompt_and_output(
-    prompt_strs, output_strs, tokenizer: PreTrainedTokenizerBase
+    prompt_strs, output_strs, tokenizer: PreTrainedTokenizerBase, device=None
 ):
     batch_encoding = tokenizer.batch_encode_plus(
         [(prompt_strs[i], output_strs[i]) for i in range(len(prompt_strs))],
@@ -245,6 +248,10 @@ def tokenize_prompt_and_output(
     labels = input_ids[:, 1:].clone()  # (batch_size, max_seq_len-1)
     input_ids = input_ids[:, :-1]  # (batch_size, max_seq_len-1)
     response_mask = batch_encoding["token_type_ids"].bool()[:, 1:]
+    if device is not None:
+        input_ids = input_ids.to(device)
+        labels = labels.to(device)
+        response_mask = response_mask.to(device)
     return {"input_ids": input_ids, "labels": labels, "response_mask": response_mask}
 
 
@@ -366,8 +373,9 @@ def save_model(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, outpu
 def load_model(device=None):
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen2.5-Math-1.5B",
-        torch_dtype=torch.float16,
-        attn_implementation="flash_attention_2",
+        dtype=torch.float16,
+        # attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
     if device is not None:
         model.to(device)
@@ -379,31 +387,50 @@ def train(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     lr=1e-4,
-    max_steps=8,
-    per_device_train_batch_size=8,
-    gradient_accumulation_steps=1,
+    num_train_epochs=3,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    max_steps=25,
     log_name=None,
 ):
+    betas = (0.9, 0.999)
+    weight_decay = 0.0
+    max_grad_norm = 1.0
+
+    sft_data = load_sft()
+    batch_size_per_step = per_device_train_batch_size * gradient_accumulation_steps
+    step_per_epoch = len(sft_data) // batch_size_per_step
+    assert step_per_epoch > 0, "Not enough data for training."
+    num_train_steps = min(step_per_epoch * num_train_epochs, max_steps)
+    indexes = None
     if log_name is not None:
         run = init_wandb(
             name=log_name,
             lr=lr,
             per_device_train_batch_size=per_device_train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            betas=betas,
+            weight_decay=weight_decay,
+            num_train_epochs=num_train_epochs,
+            num_train_steps=num_train_steps,
         )
     else:
         run = nullcontext()
-    sft_data = load_sft()
-    N = min(
-        max_steps * per_device_train_batch_size * gradient_accumulation_steps,
-        len(sft_data),
-    )
-    indexes = np.random.choice(len(sft_data), N, replace=False)
-    stride = per_device_train_batch_size * gradient_accumulation_steps
+    optimizer = AdamW(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=lr / 10)
+    optimizer.zero_grad()
     with run:
         checkpoint_step = 0
-        for step in trange(max_steps):
-            batch_indexes = indexes[step * stride : (step + 1) * stride]
+        for step in trange(num_train_steps):
+            epoch = step // step_per_epoch
+            if step % step_per_epoch == 0:  # new epoch
+                indexes = np.random.choice(
+                    len(sft_data), batch_size_per_step * step_per_epoch, replace=False
+                )
+
+            batch_indexes = indexes[
+                step * batch_size_per_step : (step + 1) * batch_size_per_step
+            ]
             losses = []
             token_entropies = []
             for j in range(gradient_accumulation_steps):
@@ -413,12 +440,16 @@ def train(
                 ]
                 prompts = sft_data.iloc[_batch_indexes].prompt.tolist()
                 responses = sft_data.iloc[_batch_indexes].response.tolist()
-                input_data = tokenize_prompt_and_output(make_prompt(prompts), responses)
-                response_mask = input_data["response_mask"].to(device)
+                input_data = tokenize_prompt_and_output(
+                    make_prompt(prompts), responses, tokenizer, device=device
+                )
+                input_ids = input_data.pop("input_ids")
+                labels = input_data.pop("labels")
+                response_mask = input_data.pop("response_mask")
                 result = get_response_log_probs(
                     model,
-                    input_data["input_ids"].to(device),
-                    input_data["labels"].to(device),
+                    input_ids,
+                    labels,
                     return_token_entropy=True,
                 )
                 log_probs = result["log_probs"]
@@ -437,17 +468,28 @@ def train(
                     normalize_constant=normalize_constant,
                 )
                 losses.append(loss.detach().cpu().numpy().item())
-            loss = sum(losses)
-            token_entropy = sum(token_entropies)
+
+                # del input_ids, labels
+                # torch.cuda.empty_cache()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
             step += 1
             checkpoint_step = step
+
+            # ----- log -----
+            loss = sum(losses)
+            token_entropy = sum(token_entropies)
             if step % 1 == 0:
                 tqdm.write(
-                    f"Step [{step}/{max_steps}], loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
+                    f"[{epoch}/{num_train_epochs}, {step}/{num_train_steps}], loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
                 )
             run.log(
                 {
                     "train_step": step,
+                    "train/epoch": epoch,
                     "train/loss": loss,
                     "train/token_entropy": token_entropy,
                 }
