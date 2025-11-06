@@ -14,7 +14,7 @@ import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm, trange
+from tqdm import tqdm, trange
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -162,6 +162,7 @@ def save_jsonl(lines: Union[list[dict], pd.DataFrame], path, overwrite=False):
                 f.write(json_line)
             else:
                 f.write("\n" + json_line)
+    print(f"Saved {len(lines)} lines to {path.as_posix()}")
 
 
 def load_jsonl(path):
@@ -244,6 +245,7 @@ def evaluate_pretrained(
             assert not save_path.exists()
     raw_prompts = prompts
     prompts = make_prompt(prompts)
+    tokenizer.padding_side = "left"
 
     outputs = []
     bar = tqdm(total=len(prompts))
@@ -289,19 +291,28 @@ def evaluate_pretrained(
     return results
 
 
-def eval_validation(
-    model: Union[LLM, PreTrainedModel], batch_size=8, save_path=None, overwrite=False
+def evaluate_dataset(
+    model: Union[LLM, PreTrainedModel],
+    tokenizer: PreTrainedTokenizerBase = None,
+    batch_size=8,
+    data_name="validation",
+    prompts=None,
+    ground_truths=None,
+    save_path=None,
+    overwrite=False,
 ):
-    path = project_dir.joinpath("data", "MATH", "validation.jsonl")
-    data = pd.read_json(path_or_buf=path, lines=True)
-    problems = list(data.problem)
-    solutions = list(data.solution)
+    if prompts is None:
+        assert ground_truths is None
+        path = project_dir.joinpath("data", "MATH", f"{data_name}.jsonl")
+        data = load_jsonl(path)
+        prompts = list(data.problem)
+        ground_truths = list(data.solution)
     if isinstance(model, LLM):
         return evaluate_vllm(
             llm=model,
             reward_fn=drgrpo_grader.r1_zero_reward_fn,
-            prompts=problems,
-            ground_truths=solutions,
+            prompts=prompts,
+            ground_truths=ground_truths,
             sampling_params=SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
@@ -314,14 +325,13 @@ def eval_validation(
             # max_num_seqs=batch_size,
         )
     else:
-        tokenizer = load_tokenizer(padding_side="left")
         pad_token = tokenizer.special_tokens_map["pad_token"]
         return evaluate_pretrained(
             model=model,
             tokenizer=tokenizer,
             reward_fn=drgrpo_grader.r1_zero_reward_fn,
-            prompts=problems,
-            ground_truths=solutions,
+            prompts=prompts,
+            ground_truths=ground_truths,
             generation_config=GenerationConfig(
                 temperature=1.0,
                 top_p=1.0,
@@ -343,19 +353,13 @@ def load_zero_shot_baseline():
     return data
 
 
-def encode2(tokenizer: PreTrainedTokenizerBase):
-    sft_data = load_sft()
-    prompts = list(sft_data.prompt)
-    responses = list(sft_data.response)
-    return tokenize_prompt_and_output(make_prompt(prompts), responses, tokenizer)
-
-
 # ----- train -----
 
 
 def tokenize_prompt_and_output(
     prompt_strs, output_strs, tokenizer: PreTrainedTokenizerBase, device=None
 ):
+    tokenizer.padding_side = "right"
     batch_encoding = tokenizer(
         [(prompt_strs[i], output_strs[i]) for i in range(len(prompt_strs))],
         padding=True,
@@ -482,31 +486,41 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     llm_model.load_weights(state_dict.items())
 
 
-def save_model(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, output_dir):
+def save_model(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    output_dir,
+    overwrite=False,
+):
+    if not overwrite:
+        assert not Path(output_dir).exists()
     model.save_pretrained(save_directory=output_dir, max_shard_size="10GB")
     tokenizer.save_pretrained(save_directory=output_dir)
 
 
-def load_model(device=None, dtype=torch.float16, padding_side="right"):
+def load_model(
+    model_path="Qwen/Qwen2.5-Math-1.5B",
+    device=None,
+    dtype=torch.float16,
+    padding_side="right",
+):
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen2.5-Math-1.5B",
+        model_path,
         dtype=dtype,
         # attn_implementation="flash_attention_2",
         attn_implementation="sdpa",
     )
     if device is not None:
         model.to(device)
-    tokenizer = load_tokenizer(padding_side=padding_side)
+    tokenizer = load_tokenizer(model_path=model_path, padding_side=padding_side)
     return model, tokenizer
 
 
-def load_tokenizer(padding_side="right"):
+def load_tokenizer(model_path="Qwen/Qwen2.5-Math-1.5B", padding_side="right"):
     """
     for decoder-only models, padding_side should be "right" for training, "left" for inference
     """
-    tokenizer = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen2.5-Math-1.5B", padding_side=padding_side
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side=padding_side)
     return tokenizer
 
 
@@ -517,21 +531,28 @@ def train(
     num_train_epochs=3,
     per_device_train_batch_size=1,
     gradient_accumulation_steps=8,
-    max_steps=25,
+    eval_per_epoch=True,
+    max_steps=None,
     max_samples=None,
+    sft_data=None,
     log_name=None,
+    save=True,
 ):
-    assert tokenizer.padding_side == "right"  # for training
     betas = (0.9, 0.999)
     weight_decay = 0.0
     max_grad_norm = 1.0
 
-    sft_data = load_sft(max_samples=max_samples)
+    if sft_data is None:
+        sft_data = load_sft(max_samples=max_samples)
+    if max_samples is None:
+        max_samples = len(sft_data)
     per_step_train_batch_size = (
         per_device_train_batch_size * gradient_accumulation_steps
     )  # assume num_devices = 1
     step_per_epoch = len(sft_data) // per_step_train_batch_size
     assert step_per_epoch > 0, "Not enough data for training."
+    if max_steps is None:
+        max_steps = step_per_epoch * num_train_epochs
     num_train_steps = min(step_per_epoch * num_train_epochs, max_steps)
     indexes = None
     if log_name is not None:
@@ -552,12 +573,15 @@ def train(
     optimizer = AdamW(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=lr / 10)
     optimizer.zero_grad()
-    set_random_seed(3407)
     with run:
         checkpoint_step = 0
+        checkpoint_epoch = 0
+        checkpoint_sample = 0
+        t0 = time.time()
         for step in trange(num_train_steps):
             epoch = step // step_per_epoch
-            if step % step_per_epoch == 0:  # new epoch
+            is_new_epoch = step % step_per_epoch == 0
+            if is_new_epoch:
                 indexes = np.random.choice(
                     len(sft_data),
                     per_step_train_batch_size * step_per_epoch,
@@ -619,14 +643,27 @@ def train(
             optimizer.zero_grad()
             scheduler.step()
             step += 1
+            epoch += 1
+            checkpoint_epoch = epoch
             checkpoint_step = step
+            checkpoint_sample += len(batch_indexes)
+            model_name = f"{log_name}-sample{max_samples}-epoch{checkpoint_epoch}-step{checkpoint_step}"
+
+            if step % step_per_epoch == 0 and eval_per_epoch:  # the epoch ends
+                # evaluate_dataset(model, tokenizer, save_path=f"{model_name}.jsonl")
+                if num_train_steps != step: # save to eval later
+                    save_model(
+                        model,
+                        tokenizer,
+                        output_dir=project_dir / "checkpoints" / model_name,
+                    )
 
             # ----- log -----
             loss = sum(losses)
             token_entropy = sum(token_entropies)
             if step % 1 == 0:
                 tqdm.write(
-                    f"[{epoch+1}/{num_train_epochs}, {step}/{num_train_steps}], loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
+                    f"[{epoch}/{num_train_epochs}, {step}/{num_train_steps}], loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
                 )
             if log_name is not None:
                 run.log(
@@ -635,14 +672,83 @@ def train(
                         "train/epoch": epoch,
                         "train/loss": loss,
                         "train/token_entropy": token_entropy,
+                        "train/time": time.time() - t0,
                     }
                 )
         if log_name is not None:
-            save_model(
+            if save:
+                save_model(
+                    model,
+                    tokenizer,
+                    output_dir=project_dir / "checkpoints" / model_name,
+                )
+            run.finish()
+
+
+def make_ei_dataset(
+    model: Union[LLM, PreTrainedModel],
+    tokenizer: PreTrainedTokenizerBase = None,
+    ei_batch_size=512,
+    rollouts=2,
+    seed=42,
+    step=None,
+):
+    path = project_dir.joinpath("data", "MATH", "train.jsonl")
+    data = pd.read_json(path_or_buf=path, lines=True)
+    np.random.seed(seed)
+    indexes = np.random.choice(len(data), ei_batch_size, replace=False)
+    indexes = np.sort(indexes)
+
+    ei_data = pd.DataFrame(columns=["data_type", "data_index", "prompt", "response"])
+    problems = data.problem[indexes].tolist()
+    solutions = data.solution[indexes].tolist()
+    for _ in range(rollouts):
+        results = evaluate_dataset(
+            model,
+            tokenizer,
+            batch_size=8,
+            prompts=problems,
+            ground_truths=solutions,
+        )
+
+        for i, result in enumerate(results):
+            if result["reward"] == 0:
+                continue
+            ei_data.loc[len(ei_data)] = {
+                "data_type": "train",
+                "data_index": indexes[i],
+                "prompt": result["problem"],
+                "response": result["response"],
+            }
+    success_rate = len(ei_data) / (ei_batch_size * rollouts)
+    print(f"success_rate: {success_rate:.3f}")
+    if len(ei_data) and step is not None:
+        path = project_dir.joinpath(
+            "data", "MATH", f"ei_{ei_batch_size}_step{step}.jsonl"
+        )
+        save_jsonl(ei_data.to_dict(orient="records"), path)
+    return ei_data
+
+
+def train_ei(n_ei_steps=5):
+    model, tokenizer = load_model(device=device)
+    ei_data = load_jsonl(project_dir.joinpath("data", "MATH", "ei_512_step1.jsonl"))
+    for ei_step in range(n_ei_steps):
+        if ei_step > 0:
+            ei_data = make_ei_dataset(
                 model,
                 tokenizer,
-                output_dir=project_dir
-                / "checkpoints"
-                / f"{log_name}_step{checkpoint_step}",
+                ei_batch_size=512,
+                rollouts=2,
+                seed=3407 + ei_step,
+                step=ei_step + 1,
             )
-            run.finish()
+        train(
+            model,
+            tokenizer,
+            num_train_epochs=3,
+            gradient_accumulation_steps=16,
+            sft_data=ei_data,
+            log_name=f"ei512-ei_step{ei_step+1}",
+            save=ei_step == n_ei_steps - 1,
+        )
