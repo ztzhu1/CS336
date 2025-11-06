@@ -3,6 +3,7 @@ from contextlib import nullcontext
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Callable, List, Union
 from unittest.mock import patch
 
@@ -169,7 +170,7 @@ def load_jsonl(path):
 
 
 def evaluate_vllm(
-    model: LLM,
+    llm: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
     prompts: List[str],
     ground_truths: List[str],
@@ -195,7 +196,7 @@ def evaluate_vllm(
             assert not save_path.exists()
     raw_prompts = prompts
     prompts = make_prompt(prompts)
-    outputs = model.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params)
 
     results = []
     for i, output in enumerate(outputs):
@@ -210,6 +211,7 @@ def evaluate_vllm(
         results.append(result)
     if save_path is not None:
         save_jsonl(results, save_path, overwrite=overwrite)
+    return results
 
 
 def evaluate_pretrained(
@@ -218,7 +220,8 @@ def evaluate_pretrained(
     reward_fn: Callable[[str, str], dict[str, float]],
     prompts: List[str],
     ground_truths: List[str],
-    sampling_params: SamplingParams,
+    generation_config: GenerationConfig,
+    batch_size=8,
     save_path=None,
     overwrite=False,
 ) -> None:
@@ -226,12 +229,13 @@ def evaluate_pretrained(
     Evaluate a language model on a list of prompts,
     compute evaluation metrics, and serialize results to disk.
 
-    sampling_params = SamplingParams(
+    generation_config = GenerationConfig(
         temperature=1.0,
         top_p=1.0,
-        max_tokens=1024,
-        stop=["</answer>"],
-        include_stop_str_in_output=True,
+        min_new_tokens=4,
+        max_new_tokens=1024,
+        stop_strings=["</answer>"],
+        do_sample=True,
     )
     """
     if save_path is not None:
@@ -240,21 +244,38 @@ def evaluate_pretrained(
             assert not save_path.exists()
     raw_prompts = prompts
     prompts = make_prompt(prompts)
-    outputs = model.generate(prompts, sampling_params)
 
-    generation_config = GenerationConfig(
-        temperature=1.0,  # 温度，1.0 表示完全随机采样
-        top_p=1.0,  # 核采样概率，1.0 表示不限制（等同于纯温度采样）
-        max_new_tokens=1024,  # 最大新生成 token 数（对应 vLLM 的 max_tokens）
-        stop_sequences=[""],  # 停止序列（部分模型可能需要转换为 token id）
-        do_sample=True,  # 启用采样（非贪婪解码）
-        pad_token_id=tokenizer.pad_token_id,  # 填充 token id（避免警告）
-        eos_token_id=tokenizer.eos_token_id,  # 结束 token id（部分模型依赖）
-    )
+    outputs = []
+    bar = tqdm(total=len(prompts))
+    input_tokens = 0
+    output_tokens = 0
+    t0 = time.time()
+    for i in range(np.ceil(len(prompts) / batch_size).astype(int)):
+        batch_prompts = prompts[i * batch_size : (i + 1) * batch_size]
+        inputs = tokenizer(batch_prompts, padding=True, return_tensors="pt").to(device)
+        input_tokens += inputs["attention_mask"].sum()
+        _outputs = model.generate(
+            **inputs, generation_config=generation_config, tokenizer=tokenizer
+        )
+        _outputs = _outputs[:, inputs["input_ids"].shape[1] :]
+        _outputs = tokenizer.batch_decode(_outputs, skip_special_tokens=True)
+        for i in range(len(_outputs)):
+            index = _outputs[i].find("</answer>")
+            if index >= 0:
+                _outputs[i] = _outputs[i][: index + len("</answer>")]
+        outputs.extend(_outputs)
+        for o in _outputs:
+            output_tokens += len(tokenizer.encode(o))
+        t = time.time() - t0
+        bar.update(len(_outputs))
+        bar.set_postfix_str(
+            f"input: {input_tokens/t:.1f} toks/s, output: {output_tokens/t:.1f} toks/s"
+        )
+    bar.close()
 
     results = []
     for i, output in enumerate(outputs):
-        response = output.outputs[0].text
+        response = output
         reward = reward_fn(response, ground_truths[i])
         result = {
             "problem": raw_prompts[i],
@@ -265,28 +286,55 @@ def evaluate_pretrained(
         results.append(result)
     if save_path is not None:
         save_jsonl(results, save_path, overwrite=overwrite)
+    return results
 
 
-def eval_zero_shot_baseline(model: LLM, overwrite=False):
+def eval_validation(
+    model: Union[LLM, PreTrainedModel], batch_size=8, save_path=None, overwrite=False
+):
     path = project_dir.joinpath("data", "MATH", "validation.jsonl")
     data = pd.read_json(path_or_buf=path, lines=True)
     problems = list(data.problem)
     solutions = list(data.solution)
-    evaluate_vllm(
-        vllm_model=model,
-        reward_fn=drgrpo_grader.r1_zero_reward_fn,
-        prompts=problems,
-        ground_truths=solutions,
-        sampling_params=SamplingParams(
-            temperature=1.0,
-            top_p=1.0,
-            max_tokens=1024,
-            stop=["</answer>"],
-            include_stop_str_in_output=True,
-        ),
-        save_path="zero_baseline.jsonl",
-        overwrite=overwrite,
-    )
+    if isinstance(model, LLM):
+        return evaluate_vllm(
+            llm=model,
+            reward_fn=drgrpo_grader.r1_zero_reward_fn,
+            prompts=problems,
+            ground_truths=solutions,
+            sampling_params=SamplingParams(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=1024,
+                stop=["</answer>"],
+                include_stop_str_in_output=True,
+            ),
+            save_path=save_path,
+            overwrite=overwrite,
+            # max_num_seqs=batch_size,
+        )
+    else:
+        tokenizer = load_tokenizer(padding_side="left")
+        pad_token = tokenizer.special_tokens_map["pad_token"]
+        return evaluate_pretrained(
+            model=model,
+            tokenizer=tokenizer,
+            reward_fn=drgrpo_grader.r1_zero_reward_fn,
+            prompts=problems,
+            ground_truths=solutions,
+            generation_config=GenerationConfig(
+                temperature=1.0,
+                top_p=1.0,
+                min_new_tokens=4,
+                max_new_tokens=1024,
+                stop_strings=["</answer>"],
+                do_sample=True,
+                pad_token_id=tokenizer.encode(pad_token)[0],
+            ),
+            batch_size=batch_size,
+            save_path=save_path,
+            overwrite=overwrite,
+        )
 
 
 def load_zero_shot_baseline():
@@ -308,10 +356,10 @@ def encode2(tokenizer: PreTrainedTokenizerBase):
 def tokenize_prompt_and_output(
     prompt_strs, output_strs, tokenizer: PreTrainedTokenizerBase, device=None
 ):
-    batch_encoding = tokenizer.batch_encode_plus(
+    batch_encoding = tokenizer(
         [(prompt_strs[i], output_strs[i]) for i in range(len(prompt_strs))],
         padding=True,
-        return_token_type_ids=1,
+        return_token_type_ids=True,
         return_tensors="pt",
     )
     input_ids = batch_encoding["input_ids"]  # (batch_size, max_seq_len)
@@ -439,7 +487,7 @@ def save_model(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, outpu
     tokenizer.save_pretrained(save_directory=output_dir)
 
 
-def load_model(device=None, dtype=torch.float16):
+def load_model(device=None, dtype=torch.float16, padding_side="right"):
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen2.5-Math-1.5B",
         dtype=dtype,
@@ -448,8 +496,18 @@ def load_model(device=None, dtype=torch.float16):
     )
     if device is not None:
         model.to(device)
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B")
+    tokenizer = load_tokenizer(padding_side=padding_side)
     return model, tokenizer
+
+
+def load_tokenizer(padding_side="right"):
+    """
+    for decoder-only models, padding_side should be "right" for training, "left" for inference
+    """
+    tokenizer = AutoTokenizer.from_pretrained(
+        "Qwen/Qwen2.5-Math-1.5B", padding_side=padding_side
+    )
+    return tokenizer
 
 
 def train(
@@ -463,6 +521,7 @@ def train(
     max_samples=None,
     log_name=None,
 ):
+    assert tokenizer.padding_side == "right"  # for training
     betas = (0.9, 0.999)
     weight_decay = 0.0
     max_grad_norm = 1.0
