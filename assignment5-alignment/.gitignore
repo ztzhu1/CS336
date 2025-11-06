@@ -1,6 +1,10 @@
 *.bin
 models/
-data/
+!data/
+data/*
+!data/MATH
+data/MATH/*
+!data/MATH/sft.jsonl
 evaluation/
 
 nav

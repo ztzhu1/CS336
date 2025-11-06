@@ -17,11 +17,12 @@ from tqdm.auto import tqdm, trange
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
 from vllm import LLM, SamplingParams
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
+from vllm.model_executor import set_random_seed
 import wandb
 
 from cs336_alignment import drgrpo_grader
@@ -39,13 +40,15 @@ with open(project_dir / "api_keys.json", "r") as f:
     api_keys = json.load(f)
 
 
-def load_sft():
+def load_sft(max_samples=None):
     path = project_dir.joinpath("data", "MATH", "sft.jsonl")
     sft_data = pd.read_json(
         path_or_buf=path,
         lines=True,
         dtype={"data_type": str, "data_index": int, "prompt": str, "response": str},
     )
+    if max_samples is not None:
+        sft_data = sft_data.iloc[:max_samples]
     return sft_data
 
 
@@ -92,7 +95,10 @@ def make_sft_dataset(batch_size=1, indexes=None):
                     "role": "system",
                     "content": "You are a math Chain-of-Thought annotation expert. Generate the reasoning trace followed by an answer according to the requirements.",
                 },
-                {"role": "user", "content": pre_prompt + data.iloc[index].to_json()},
+                {
+                    "role": "user",
+                    "content": pre_prompt + data.iloc[index].to_json(force_ascii=False),
+                },
             ],
             stream=False,
         )
@@ -115,7 +121,7 @@ def make_sft_dataset(batch_size=1, indexes=None):
             "response": response,
         }
     path = project_dir.joinpath("data", "MATH", "sft.jsonl")
-    # sft_data.to_json(path, lines=True, orient="records")
+    # sft_data.to_json(path, lines=True, orient="records", force_ascii=False)
     save_jsonl(sft_data.to_dict(orient="records"), path, overwrite=True)
 
 
@@ -140,22 +146,30 @@ def check_sft_dataset(fast=False):
     return rewards
 
 
-def save_jsonl(lines: list[dict], path, overwrite=False):
+def save_jsonl(lines: Union[list[dict], pd.DataFrame], path, overwrite=False):
+    if isinstance(lines, pd.DataFrame):
+        lines = lines.to_dict(orient="records")
+
     path = Path(path)
     if not overwrite:
         assert not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         for i, line in enumerate(lines):
-            json_line = json.dumps(line)
+            json_line = json.dumps(line, ensure_ascii=False, separators=(",", ":"))
             if i == 0:
                 f.write(json_line)
             else:
                 f.write("\n" + json_line)
 
 
+def load_jsonl(path):
+    data = pd.read_json(path_or_buf=path, lines=True)
+    return data
+
+
 def evaluate_vllm(
-    vllm_model: LLM,
+    model: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
     prompts: List[str],
     ground_truths: List[str],
@@ -181,7 +195,63 @@ def evaluate_vllm(
             assert not save_path.exists()
     raw_prompts = prompts
     prompts = make_prompt(prompts)
-    outputs = vllm_model.generate(prompts, sampling_params)
+    outputs = model.generate(prompts, sampling_params)
+
+    results = []
+    for i, output in enumerate(outputs):
+        response = output.outputs[0].text
+        reward = reward_fn(response, ground_truths[i])
+        result = {
+            "problem": raw_prompts[i],
+            "solution": ground_truths[i],
+            "response": response,
+        }
+        result.update(reward)
+        results.append(result)
+    if save_path is not None:
+        save_jsonl(results, save_path, overwrite=overwrite)
+
+
+def evaluate_pretrained(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    prompts: List[str],
+    ground_truths: List[str],
+    sampling_params: SamplingParams,
+    save_path=None,
+    overwrite=False,
+) -> None:
+    """
+    Evaluate a language model on a list of prompts,
+    compute evaluation metrics, and serialize results to disk.
+
+    sampling_params = SamplingParams(
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=1024,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+    )
+    """
+    if save_path is not None:
+        save_path = project_dir / "evaluation" / save_path
+        if not overwrite:
+            assert not save_path.exists()
+    raw_prompts = prompts
+    prompts = make_prompt(prompts)
+    outputs = model.generate(prompts, sampling_params)
+
+    generation_config = GenerationConfig(
+        temperature=1.0,  # 温度，1.0 表示完全随机采样
+        top_p=1.0,  # 核采样概率，1.0 表示不限制（等同于纯温度采样）
+        max_new_tokens=1024,  # 最大新生成 token 数（对应 vLLM 的 max_tokens）
+        stop_sequences=[""],  # 停止序列（部分模型可能需要转换为 token id）
+        do_sample=True,  # 启用采样（非贪婪解码）
+        pad_token_id=tokenizer.pad_token_id,  # 填充 token id（避免警告）
+        eos_token_id=tokenizer.eos_token_id,  # 结束 token id（部分模型依赖）
+    )
+
     results = []
     for i, output in enumerate(outputs):
         response = output.outputs[0].text
@@ -338,9 +408,9 @@ def init_wandb(name, **config):
     return run
 
 
-def init_vllm(device: str, seed: int, gpu_memory_utilization: float = 0.85):
+def init_vllm(seed: int = 3407, gpu_memory_utilization: float = 0.85):
     model_id = "Qwen/Qwen2.5-Math-1.5B"
-    vllm_set_random_seed(seed)
+    set_random_seed(seed)
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
     profiling_patch = patch(
         "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
@@ -349,7 +419,6 @@ def init_vllm(device: str, seed: int, gpu_memory_utilization: float = 0.85):
     with world_size_patch, profiling_patch:
         return LLM(
             model=model_id,
-            device=device,
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
         )
@@ -366,14 +435,14 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
 
 
 def save_model(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, output_dir):
-    model.save_pretrained(save_directory=output_dir)
+    model.save_pretrained(save_directory=output_dir, max_shard_size="10GB")
     tokenizer.save_pretrained(save_directory=output_dir)
 
 
-def load_model(device=None):
+def load_model(device=None, dtype=torch.float16):
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen2.5-Math-1.5B",
-        dtype=torch.float16,
+        dtype=dtype,
         # attn_implementation="flash_attention_2",
         attn_implementation="sdpa",
     )
@@ -391,15 +460,18 @@ def train(
     per_device_train_batch_size=1,
     gradient_accumulation_steps=8,
     max_steps=25,
+    max_samples=None,
     log_name=None,
 ):
     betas = (0.9, 0.999)
     weight_decay = 0.0
     max_grad_norm = 1.0
 
-    sft_data = load_sft()
-    batch_size_per_step = per_device_train_batch_size * gradient_accumulation_steps
-    step_per_epoch = len(sft_data) // batch_size_per_step
+    sft_data = load_sft(max_samples=max_samples)
+    per_step_train_batch_size = (
+        per_device_train_batch_size * gradient_accumulation_steps
+    )  # assume num_devices = 1
+    step_per_epoch = len(sft_data) // per_step_train_batch_size
     assert step_per_epoch > 0, "Not enough data for training."
     num_train_steps = min(step_per_epoch * num_train_epochs, max_steps)
     indexes = None
@@ -409,8 +481,10 @@ def train(
             lr=lr,
             per_device_train_batch_size=per_device_train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            per_step_train_batch_size=per_step_train_batch_size,
             betas=betas,
             weight_decay=weight_decay,
+            max_samples=max_samples,
             num_train_epochs=num_train_epochs,
             num_train_steps=num_train_steps,
         )
@@ -419,17 +493,22 @@ def train(
     optimizer = AdamW(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=lr / 10)
     optimizer.zero_grad()
+    set_random_seed(3407)
     with run:
         checkpoint_step = 0
         for step in trange(num_train_steps):
             epoch = step // step_per_epoch
             if step % step_per_epoch == 0:  # new epoch
                 indexes = np.random.choice(
-                    len(sft_data), batch_size_per_step * step_per_epoch, replace=False
+                    len(sft_data),
+                    per_step_train_batch_size * step_per_epoch,
+                    replace=False,
                 )
 
             batch_indexes = indexes[
-                step * batch_size_per_step : (step + 1) * batch_size_per_step
+                (step % step_per_epoch)
+                * per_step_train_batch_size : (step % step_per_epoch + 1)
+                * per_step_train_batch_size
             ]
             losses = []
             token_entropies = []
@@ -455,11 +534,15 @@ def train(
                 log_probs = result["log_probs"]
                 normalize_constant = response_mask.sum(-1, keepdim=True)
 
-                token_entropy = masked_normalize(
-                    result["token_entropy"], response_mask, normalize_constant, dim=-1
-                )  # (batch_size,)
-                token_entropy = token_entropy.mean() / gradient_accumulation_steps
-                token_entropies.append(token_entropy.detach().cpu().numpy().item())
+                with torch.inference_mode():
+                    token_entropy = masked_normalize(
+                        result["token_entropy"],
+                        response_mask,
+                        normalize_constant,
+                        dim=-1,
+                    )  # (batch_size,)
+                    token_entropy = token_entropy.mean() / gradient_accumulation_steps
+                    token_entropies.append(token_entropy.detach().cpu().numpy().item())
 
                 loss, _ = sft_microbatch_train_step(
                     policy_log_probs=log_probs,
@@ -484,16 +567,17 @@ def train(
             token_entropy = sum(token_entropies)
             if step % 1 == 0:
                 tqdm.write(
-                    f"[{epoch}/{num_train_epochs}, {step}/{num_train_steps}], loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
+                    f"[{epoch+1}/{num_train_epochs}, {step}/{num_train_steps}], loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
                 )
-            run.log(
-                {
-                    "train_step": step,
-                    "train/epoch": epoch,
-                    "train/loss": loss,
-                    "train/token_entropy": token_entropy,
-                }
-            )
+            if log_name is not None:
+                run.log(
+                    {
+                        "train_step": step,
+                        "train/epoch": epoch,
+                        "train/loss": loss,
+                        "train/token_entropy": token_entropy,
+                    }
+                )
         if log_name is not None:
             save_model(
                 model,
