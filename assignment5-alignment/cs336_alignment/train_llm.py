@@ -537,6 +537,7 @@ def train(
     sft_data=None,
     log_name=None,
     save=True,
+    save_per_epoch=True,
 ):
     betas = (0.9, 0.999)
     weight_decay = 0.0
@@ -651,7 +652,7 @@ def train(
 
             if step % step_per_epoch == 0 and eval_per_epoch:  # the epoch ends
                 # evaluate_dataset(model, tokenizer, save_path=f"{model_name}.jsonl")
-                if num_train_steps != step: # save to eval later
+                if num_train_steps != step and save_per_epoch:  # save to eval later
                     save_model(
                         model,
                         tokenizer,
@@ -730,25 +731,36 @@ def make_ei_dataset(
     return ei_data
 
 
-def train_ei(n_ei_steps=5):
-    model, tokenizer = load_model(device=device)
-    ei_data = load_jsonl(project_dir.joinpath("data", "MATH", "ei_512_step1.jsonl"))
-    for ei_step in range(n_ei_steps):
-        if ei_step > 0:
-            ei_data = make_ei_dataset(
-                model,
-                tokenizer,
-                ei_batch_size=512,
-                rollouts=2,
-                seed=3407 + ei_step,
-                step=ei_step + 1,
-            )
-        train(
-            model,
-            tokenizer,
-            num_train_epochs=3,
-            gradient_accumulation_steps=16,
-            sft_data=ei_data,
-            log_name=f"ei512-ei_step{ei_step+1}",
-            save=ei_step == n_ei_steps - 1,
-        )
+def train_ei(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, ei_step=1):
+    ei_data = load_jsonl(
+        project_dir.joinpath("data", "MATH", f"ei_512_step{ei_step}.jsonl")
+    )
+    train(
+        model,
+        tokenizer,
+        num_train_epochs=3,
+        gradient_accumulation_steps=8,
+        sft_data=ei_data,
+        log_name=f"ei512-ei_step{ei_step}",
+        save=True,
+        save_per_epoch=False,
+    )
+    # for ei_step in range(n_ei_steps):
+    #     if ei_step > 0:
+    #         ei_data = make_ei_dataset(
+    #             model,
+    #             tokenizer,
+    #             ei_batch_size=512,
+    #             rollouts=2,
+    #             seed=3407 + ei_step,
+    #             step=ei_step + 1,
+    #         )
+    #     train(
+    #         model,
+    #         tokenizer,
+    #         num_train_epochs=3,
+    #         gradient_accumulation_steps=16,
+    #         sft_data=ei_data,
+    #         log_name=f"ei512-ei_step{ei_step+1}",
+    #         save=ei_step == n_ei_steps - 1,
+    #     )

@@ -3,8 +3,13 @@ models/
 !data/
 data/*
 !data/MATH
+!data/alpaca_eval
+!data/gsm8k
+!data/mmlu
+!data/simple_safety_tests
 data/MATH/*
 !data/MATH/sft.jsonl
+!data/MATH/ei*.jsonl
 evaluation/
 
 nav
