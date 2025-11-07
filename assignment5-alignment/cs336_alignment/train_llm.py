@@ -192,6 +192,8 @@ def evaluate_vllm(
     )
     """
     if save_path is not None:
+        if not save_path.endswith(".jsonl"):
+            save_path = save_path + ".jsonl"
         save_path = project_dir / "evaluation" / save_path
         if not overwrite:
             assert not save_path.exists()
@@ -240,6 +242,8 @@ def evaluate_pretrained(
     )
     """
     if save_path is not None:
+        if not save_path.endswith(".jsonl"):
+            save_path = save_path + ".jsonl"
         save_path = project_dir / "evaluation" / save_path
         if not overwrite:
             assert not save_path.exists()
@@ -298,6 +302,7 @@ def evaluate_dataset(
     data_name="validation",
     prompts=None,
     ground_truths=None,
+    samples=None,
     save_path=None,
     overwrite=False,
 ):
@@ -305,6 +310,11 @@ def evaluate_dataset(
         assert ground_truths is None
         path = project_dir.joinpath("data", "MATH", f"{data_name}.jsonl")
         data = load_jsonl(path)
+        if samples is not None:
+            if isinstance(samples, int):
+                data = data.iloc[:samples]
+            else:
+                data = data.iloc[samples[0] : samples[1]]
         prompts = list(data.problem)
         ground_truths = list(data.solution)
     if isinstance(model, LLM):
@@ -694,6 +704,11 @@ def make_ei_dataset(
     seed=42,
     step=None,
 ):
+    """
+    For ei_batch_size=512, sucess rate:
+    step1: 0.054
+    step2: 0.354
+    """
     path = project_dir.joinpath("data", "MATH", "train.jsonl")
     data = pd.read_json(path_or_buf=path, lines=True)
     np.random.seed(seed)
@@ -731,7 +746,12 @@ def make_ei_dataset(
     return ei_data
 
 
-def train_ei(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, ei_step=1):
+def train_ei(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    ei_step=1,
+    gradient_accumulation_steps=8,
+):
     ei_data = load_jsonl(
         project_dir.joinpath("data", "MATH", f"ei_512_step{ei_step}.jsonl")
     )
@@ -739,7 +759,7 @@ def train_ei(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, ei_step
         model,
         tokenizer,
         num_train_epochs=3,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         sft_data=ei_data,
         log_name=f"ei512-ei_step{ei_step}",
         save=True,
@@ -764,3 +784,177 @@ def train_ei(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, ei_step
     #         log_name=f"ei512-ei_step{ei_step+1}",
     #         save=ei_step == n_ei_steps - 1,
     #     )
+
+
+# ----- GRPO -----
+def compute_group_normalized_rewards(
+    reward_fn: Callable[[str, str], dict[str, float]],
+    rollout_responses: list[str],
+    repeated_ground_truths: list[str],
+    group_size: int,
+    advantage_eps: float,
+    normalize_by_std: bool,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """
+    Parameters
+    -----
+    len(rollout_responses)=rollout_batch_size=n_prompts_per_rollout_batch*group_size
+
+    reward_fn: Callable[[str, str], dict[str, float]],
+        scores the rollout responses against the ground truths,
+        producing a dict with keys
+        "reward", "format_reward", and "answer_reward".
+    rollout_responses: list[str], rollouts from the policy.
+        The length of this list is
+        `rollout_batch_size = n_prompts_per_rollout_batch * group_size`.
+    repeated_ground_truths: list[str], the ground truths for the examples.
+        The length of this list is `rollout_batch_size`,
+        because the ground truth for each example is repeated `group_size` times.
+    group_size: int, number of rollouts per group.
+    advantage_eps: float, epsilon to avoid division by zero
+        during group normalization.
+    normalize_by_std: bool, whether to normalize the rewards by
+        std(rewards).
+
+    Return
+    -----
+    advantages: (rollout_batch_size,)
+    raw_rewards: (rollout_batch_size,)
+    metadata
+    """
+    metadata = {}
+    i = 0
+    advantages = []
+    raw_rewards = []
+    while i < len(rollout_responses):
+        response = rollout_responses[i : i + group_size]
+        ground_truth = repeated_ground_truths[i : i + group_size]
+        assert len(response) == group_size
+        rewards = []
+        for j in range(len(response)):
+            reward = reward_fn(response[j], ground_truth[j])
+            rewards.append(reward["reward"])
+        rewards = np.array(rewards)
+        _advantages = rewards - np.mean(rewards)
+        if normalize_by_std:
+            _advantages = _advantages / (np.std(rewards, ddof=1) + advantage_eps)
+        advantages.extend(_advantages.tolist())
+        raw_rewards.extend(rewards.tolist())
+        i += group_size
+    return advantages, raw_rewards, metadata
+
+
+def compute_naive_policy_gradient_loss(
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+) -> torch.Tensor:
+    """Compute policy gradient loss using either raw rewards or advantages.
+
+    Args:
+        raw_rewards_or_advantages: torch.Tensor of shape (batch_size, 1):
+            the raw rewards or advantages for each rollout response.
+        policy_log_probs: torch.Tensor of shape (batch_size, sequence_length):
+            the log-probs of the policy.
+
+    Returns:
+        torch.Tensor of shape (batch_size, sequence_length):
+            the policy gradient per-token loss.
+    """
+    return -raw_rewards_or_advantages * policy_log_probs
+
+
+def compute_grpo_clip_loss(
+    advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the GRPO-Clip loss.
+
+    Args:
+        advantages: torch.Tensor of shape (batch_size, 1):
+            the advantages for each rollout response.
+        policy_log_probs: torch.Tensor of shape (batch_size, sequence_length):
+            the log-probs of the policy.
+        old_log_probs: torch.Tensor of shape (batch_size, sequence_length):
+            the log-probs of the old policy.
+        cliprange: float, the clip range for the ratio.
+
+    Returns:
+        tuple[torch.Tensor, dict[str, torch.Tensor]]:
+            torch.Tensor of shape (batch_size, sequence_length):
+                the GRPO-Clip per-token loss.
+            dict[str, torch.Tensor]: metadata for the GRPO-Clip loss
+                (used to compute clip fraction).
+    """
+    weight = torch.exp(policy_log_probs - old_log_probs)
+    clipped_weight = torch.clip(weight, 1.0 - cliprange, 1.0 + cliprange)
+    loss = -torch.min(weight * advantages, clipped_weight * advantages)
+    metadata = {}
+    return loss, metadata
+
+
+def compute_policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    loss_type: str,
+    raw_rewards: torch.Tensor,
+    advantages: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Wrapper that delegates to the appropriate policy gradient loss function above.
+    """
+    assert loss_type in ["no_baseline", "reinforce_with_baseline", "grpo_clip"]
+    metadata = {}
+    if loss_type == "no_baseline":
+        return (
+            compute_naive_policy_gradient_loss(
+                raw_rewards_or_advantages=raw_rewards,
+                policy_log_probs=policy_log_probs,
+            ),
+            metadata,
+        )
+    elif loss_type == "reinforce_with_baseline":
+        return (
+            compute_naive_policy_gradient_loss(
+                raw_rewards_or_advantages=advantages,
+                policy_log_probs=policy_log_probs,
+            ),
+            metadata,
+        )
+    elif loss_type == "grpo_clip":
+        return compute_grpo_clip_loss(
+            advantages=advantages,
+            policy_log_probs=policy_log_probs,
+            old_log_probs=old_log_probs,
+            cliprange=cliprange,
+        )
+
+
+def masked_mean(
+    tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None
+) -> torch.Tensor:
+    """Compute the mean of the tensor along a dimension,
+    considering only the elements with mask value 1.
+
+    Args:
+        tensor: torch.Tensor, the tensor to compute the mean of.
+        mask: torch.Tensor, the mask. We only take the mean over
+            the elements with mask value 1.
+        dim: int | None, the dimension to compute the mean along.
+            If None, sum over all non-masked elements and average
+            by their total count.
+
+    Returns:
+        torch.Tensor, the mean of the tensor along the specified
+            dimension, considering only the elements with mask value 1.
+    """
+    masked_tensor = torch.where(mask, tensor, 0)
+    sum_tensor = masked_tensor.sum(dim, keepdim=dim is not None)
+    count = mask.sum(dim, keepdim=dim is not None)
+    # count = torch.where(count != 0, count, torch.inf)
+    mean = sum_tensor / count
+    if dim is not None:
+        mean = mean.squeeze(dim)
+    return mean
