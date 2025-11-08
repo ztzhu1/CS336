@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 import time
-from typing import Callable, List, Union
+from typing import Callable, List, Literal, Union
 from unittest.mock import patch
 
 import numpy as np
@@ -214,7 +214,7 @@ def evaluate_vllm(
         results.append(result)
     if save_path is not None:
         save_jsonl(results, save_path, overwrite=overwrite)
-    return results
+    return pd.DataFrame.from_dict(results)
 
 
 def evaluate_pretrained(
@@ -292,9 +292,10 @@ def evaluate_pretrained(
         results.append(result)
     if save_path is not None:
         save_jsonl(results, save_path, overwrite=overwrite)
-    return results
+    return pd.DataFrame.from_dict(results)
 
 
+@torch.inference_mode()
 def evaluate_dataset(
     model: Union[LLM, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase = None,
@@ -423,8 +424,8 @@ def masked_normalize(
     normalize_constant: float,
     dim: int | None = None,
 ) -> torch.Tensor:
-    tensor = torch.where(mask, tensor, 0) / normalize_constant
-    tensor = tensor.sum(dim)
+    tensor = torch.where(mask, tensor, 0)
+    tensor = tensor.sum(dim) / normalize_constant
     return tensor
 
 
@@ -433,6 +434,7 @@ def sft_microbatch_train_step(
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
     normalize_constant: float = 1.0,
+    backward=True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     policy_log_probs (batch_size, sequence_length)
@@ -442,7 +444,8 @@ def sft_microbatch_train_step(
         policy_log_probs, response_mask, normalize_constant, dim=-1
     )  # (batch_size,)
     loss = loss.mean() / gradient_accumulation_steps
-    loss.backward()
+    if backward:
+        loss.backward()
     return loss, {}
 
 
@@ -548,10 +551,12 @@ def train(
     log_name=None,
     save=True,
     save_per_epoch=True,
+    use_amp=True,
 ):
     betas = (0.9, 0.999)
     weight_decay = 0.0
     max_grad_norm = 1.0
+    scaler = torch.amp.GradScaler(str(device), enabled=use_amp)
 
     if sft_data is None:
         sft_data = load_sft(max_samples=max_samples)
@@ -570,14 +575,16 @@ def train(
         run = init_wandb(
             name=log_name,
             lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
             per_device_train_batch_size=per_device_train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             per_step_train_batch_size=per_step_train_batch_size,
-            betas=betas,
-            weight_decay=weight_decay,
             max_samples=max_samples,
             num_train_epochs=num_train_epochs,
             num_train_steps=num_train_steps,
+            use_amp=use_amp,
         )
     else:
         run = nullcontext()
@@ -619,14 +626,26 @@ def train(
                 input_ids = input_data.pop("input_ids")
                 labels = input_data.pop("labels")
                 response_mask = input_data.pop("response_mask")
-                result = get_response_log_probs(
-                    model,
-                    input_ids,
-                    labels,
-                    return_token_entropy=True,
-                )
-                log_probs = result["log_probs"]
-                normalize_constant = response_mask.sum(-1, keepdim=True)
+                with torch.autocast(
+                    device_type=str(device), dtype=torch.float16, enabled=use_amp
+                ):
+                    result = get_response_log_probs(
+                        model,
+                        input_ids,
+                        labels,
+                        return_token_entropy=True,
+                    )
+                    log_probs = result["log_probs"]
+                    normalize_constant = response_mask.sum(-1).max()
+                    loss, _ = sft_microbatch_train_step(
+                        policy_log_probs=log_probs,
+                        response_mask=response_mask,
+                        gradient_accumulation_steps=gradient_accumulation_steps,
+                        normalize_constant=normalize_constant,
+                        backward=False,
+                    )
+                scaler.scale(loss).backward()
+                losses.append(loss.detach().cpu().numpy().item())
 
                 with torch.inference_mode():
                     token_entropy = masked_normalize(
@@ -638,19 +657,13 @@ def train(
                     token_entropy = token_entropy.mean() / gradient_accumulation_steps
                     token_entropies.append(token_entropy.detach().cpu().numpy().item())
 
-                loss, _ = sft_microbatch_train_step(
-                    policy_log_probs=log_probs,
-                    response_mask=response_mask,
-                    gradient_accumulation_steps=gradient_accumulation_steps,
-                    normalize_constant=normalize_constant,
-                )
-                losses.append(loss.detach().cpu().numpy().item())
-
                 # del input_ids, labels
                 # torch.cuda.empty_cache()
 
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
             scheduler.step()
             step += 1
@@ -958,3 +971,237 @@ def masked_mean(
     if dim is not None:
         mean = mean.squeeze(dim)
     return mean
+
+
+def grpo_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the policy gradient loss and backprop its gradients for a microbatch.
+
+    Args:
+        policy_log_probs: torch.Tensor of shape (batch_size, sequence_length):
+            the log-probs of the policy.
+        response_mask: torch.Tensor of shape (batch_size, sequence_length):
+            the mask for the response.
+        gradient_accumulation_steps: int, the number of gradient accumulation steps.
+        loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+            the type of loss function to use.
+        raw_rewards: torch.Tensor | None, the raw rewards for each rollout response.
+            Needed for loss_type="no_baseline".
+        advantages: torch.Tensor | None, the advantages for each rollout response.
+            Needed for loss_type in {"reinforce_with_baseline", "grpo_clip"}.
+        old_log_probs: torch.Tensor | None, the log-probs of the old policy.
+            Needed for loss_type="grpo_clip".
+        cliprange: float | None, the clip range for the ratio.
+            Needed for loss_type="grpo_clip".
+        constant_normalize_factor: int | None, provided if we want to sum over
+            the sequence dimension and normalize by this constant factor
+            (as in Dr. GRPO).
+
+    Returns:
+        tuple[torch.Tensor, dict[str, torch.Tensor]]:
+            the policy gradient loss and its metadata.
+    """
+    metadata = {}
+    pg_loss, _metadata = compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
+    metadata.update(_metadata)
+    pg_loss = masked_mean(pg_loss, response_mask)
+    pg_loss = pg_loss / gradient_accumulation_steps
+    pg_loss.backward()
+    return pg_loss, metadata
+
+
+def train_grpo(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    n_grpo_steps: int = 100,
+    lr: float = 1e-5,
+    advantage_eps: float = 1e-6,
+    rollout_batch_size: int = 256,
+    group_size: int = 8,
+    epochs_per_rollout_batch: int = 1,  # 1 for On-policy
+    train_batch_size: int = 256,  # equals rollout_batch_size for On-policy
+    gradient_accumulation_steps: int = 128,  # microbatch size is 2, will fit on H100
+    cliprange=0.2,
+    gpu_memory_utilization: float = 0.85,  # for vllm on the 2nd GPU
+    loss_type: str = "reinforce_with_baseline",
+    seq_len_norm="masked_mean",
+    use_std_normalization: bool = True,
+    seed=3407,
+    log_name=None,
+    use_amp=True,
+):
+    betas = (0.9, 0.95)
+    weight_decay = 0.0
+    max_grad_norm = 1.0
+    scaler = torch.amp.GradScaler(str(device), enabled=use_amp)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+        betas=betas,
+    )
+    optimizer.zero_grad()
+
+    assert loss_type in ["no_baseline", "reinforce_with_baseline", "grpo_clip"]
+    assert seq_len_norm in ["masked_mean", "masked_sum"]
+    assert (
+        train_batch_size % gradient_accumulation_steps == 0
+    ), "train_batch_size must be divisible by gradient_accumulation_steps"
+    micro_train_batch_size = train_batch_size // gradient_accumulation_steps
+    assert rollout_batch_size % train_batch_size == 0
+    assert (
+        rollout_batch_size % group_size == 0
+    ), "rollout_batch_size must be divisible by group_size"
+    n_prompts_per_rollout_batch = rollout_batch_size // group_size
+    assert (
+        train_batch_size >= group_size
+    ), "train_batch_size must be greater than or equal to group_size"
+    n_microbatches_per_rollout_batch = rollout_batch_size // micro_train_batch_size
+    max_steps = (
+        n_grpo_steps
+        * epochs_per_rollout_batch
+        * (rollout_batch_size // train_batch_size)
+    )
+    off_policy = (epochs_per_rollout_batch > 1) or (
+        rollout_batch_size > train_batch_size
+    )
+    on_policy = not off_policy
+    scheduler = CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=lr / 10)
+
+    if log_name is not None:
+        run = init_wandb(
+            name=log_name,
+            lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
+            use_amp=use_amp,
+            n_grpo_steps=n_grpo_steps,
+            train_batch_size=train_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            micro_train_batch_size=micro_train_batch_size,
+            rollout_batch_size=rollout_batch_size,
+            group_size=group_size,
+            n_prompts_per_rollout_batch=n_prompts_per_rollout_batch,
+            advantage_eps=advantage_eps,
+            cliprange=cliprange,
+            epochs_per_rollout_batch=epochs_per_rollout_batch,
+            max_steps=max_steps,
+            off_policy=off_policy,
+            loss_type=loss_type,
+            seq_len_norm=seq_len_norm,
+            use_std_normalization=use_std_normalization,
+            seed=seed,
+        )
+    else:
+        run = nullcontext()
+
+    train_dataset = load_jsonl(project_dir.joinpath("data", "MATH", "train.jsonl"))
+
+    set_random_seed(seed)
+    with run:
+        total_step = 0
+        for n_grpo_step in trange(n_grpo_steps, desc="grpo step"):
+            # ----- get rollout batch -----
+            indexes = np.random.choice(
+                len(train_dataset), n_prompts_per_rollout_batch, replace=False
+            )
+            indexes = np.repeat(indexes, group_size)
+            prompts = make_prompt(train_dataset.problem[indexes].tolist())
+            solutions = train_dataset.solution[indexes].tolist()
+            if log_name is None:
+                save_path = None
+            else:
+                save_path = f"{log_name}-rollout{rollout_batch_size}-group{group_size}-grpo_step{n_grpo_step}.jsonl"
+            eval_result = evaluate_dataset(
+                model,
+                tokenizer,
+                prompts=prompts,
+                ground_truths=solutions,
+                save_path=save_path,
+                overwrite=True,
+            )
+            responses = eval_result.response.tolist()
+            advantages, raw_rewards, _ = compute_group_normalized_rewards(
+                drgrpo_grader.r1_zero_reward_fn,
+                responses,
+                solutions,
+                group_size,
+                advantage_eps,
+                use_std_normalization,
+            )
+            advantages = torch.Tensor(advantages).to(device).view(-1, 1)
+            raw_rewards = torch.Tensor(raw_rewards).to(device).view(-1, 1)
+            input_data = tokenize_prompt_and_output(
+                prompts, responses, tokenizer, device=device
+            )
+            normalize_constant = input_data["response_mask"].sum(-1).max()
+            if on_policy:
+                old_log_probs = None
+            else:  # off-policy
+                old_log_probs = torch.empty_like(input_data["input_ids"])
+            updated = False
+            for epoch in trange(epochs_per_rollout_batch, desc="rollout_batch epoch"):
+                for step in trange(
+                    n_microbatches_per_rollout_batch, "rollout_batch step"
+                ):
+                    if start % train_batch_size == 0:  # new train batch
+                        losses = []
+                        token_entropies = []
+                    start = micro_train_batch_size * step
+                    end = start + micro_train_batch_size
+                    with torch.autocast(
+                        device_type=str(device), dtype=torch.float16, enabled=use_amp
+                    ):
+                        result = get_response_log_probs(
+                            model,
+                            input_data["input_ids"][start:end],
+                            input_data["labels"][start:end],
+                            return_token_entropy=True,
+                        )
+                        log_probs = result["log_probs"]
+                        response_mask = input_data["response_mask"][start:end]
+                        per_token_loss, _ = compute_policy_gradient_loss(
+                            log_probs,
+                            loss_type,
+                            raw_rewards[start:end],
+                            advantages[start:end],
+                            log_probs[start:end]
+                            if epoch == 0
+                            else old_log_probs[start:end],
+                            cliprange=cliprange,
+                        )
+                        if seq_len_norm == "masked_mean":
+                            loss = masked_mean(per_token_loss, response_mask, -1).mean()
+                        else:
+                            loss = masked_normalize(
+                                per_token_loss, response_mask, normalize_constant, -1
+                            ).mean()
+                        loss = loss / gradient_accumulation_steps
+                        scaler.scale(loss).backward()
+                    losses.append(loss.detach().cpu().numpy().item())
+                    if end % train_batch_size == 0:  # end train batch
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_grad_norm
+                        )
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                        scheduler.step()
+                        total_step += 1
