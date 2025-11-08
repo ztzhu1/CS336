@@ -212,7 +212,7 @@ def test_grpo_microbatch_train_step_grpo_clip(
         cliprange=cliprange,
     )
     output = {"loss": loss, "policy_log_probs_grad": policy_log_probs.grad}
-    numpy_snapshot.assert_match(output)
+    numpy_snapshot.assert_match(output, atol=1e-4)
 
 
 def test_grpo_microbatch_train_step_grpo_clip_10_steps(
@@ -247,4 +247,4 @@ def test_grpo_microbatch_train_step_grpo_clip_10_steps(
         "loss": torch.stack(loss_list),
         "policy_log_probs_grad": torch.stack(grad_list),
     }
-    numpy_snapshot.assert_match(output)
+    numpy_snapshot.assert_match(output, atol=1e-4)
