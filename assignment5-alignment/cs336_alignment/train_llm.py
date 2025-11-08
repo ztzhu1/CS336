@@ -982,6 +982,9 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    seq_len_norm: str = "masked_mean",
+    normalize_constant=None,
+    backward=True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
 
@@ -1009,6 +1012,7 @@ def grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]:
             the policy gradient loss and its metadata.
     """
+    assert seq_len_norm in ["masked_mean", "masked_sum"]
     metadata = {}
     pg_loss, _metadata = compute_policy_gradient_loss(
         policy_log_probs=policy_log_probs,
@@ -1019,9 +1023,16 @@ def grpo_microbatch_train_step(
         cliprange=cliprange,
     )
     metadata.update(_metadata)
-    pg_loss = masked_mean(pg_loss, response_mask)
-    pg_loss = pg_loss / gradient_accumulation_steps
-    pg_loss.backward()
+
+    if seq_len_norm == "masked_mean":
+        pg_loss = masked_mean(pg_loss, response_mask, -1)
+    else:
+        assert normalize_constant is not None
+        pg_loss = masked_normalize(pg_loss, response_mask, normalize_constant, -1)
+    pg_loss = pg_loss.mean() / gradient_accumulation_steps
+    if backward:
+        pg_loss.backward()
+
     return pg_loss, metadata
 
 
@@ -1176,8 +1187,10 @@ def train_grpo(
                         )
                         log_probs = result["log_probs"]
                         response_mask = input_data["response_mask"][start:end]
-                        per_token_loss, _ = compute_policy_gradient_loss(
+                        loss = grpo_microbatch_train_step(
                             log_probs,
+                            response_mask,
+                            gradient_accumulation_steps,
                             loss_type,
                             raw_rewards[start:end],
                             advantages[start:end],
@@ -1185,15 +1198,11 @@ def train_grpo(
                             if epoch == 0
                             else old_log_probs[start:end],
                             cliprange=cliprange,
+                            seq_len_norm=seq_len_norm,
+                            normalize_constant=normalize_constant,
+                            backward=False,
                         )
-                        if seq_len_norm == "masked_mean":
-                            loss = masked_mean(per_token_loss, response_mask, -1).mean()
-                        else:
-                            loss = masked_normalize(
-                                per_token_loss, response_mask, normalize_constant, -1
-                            ).mean()
-                        loss = loss / gradient_accumulation_steps
-                        scaler.scale(loss).backward()
+                    scaler.scale(loss).backward()
                     losses.append(loss.detach().cpu().numpy().item())
                     if end % train_batch_size == 0:  # end train batch
                         scaler.unscale_(optimizer)
