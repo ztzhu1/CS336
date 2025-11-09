@@ -253,7 +253,7 @@ def evaluate_pretrained(
     tokenizer.padding_side = "left"
 
     outputs = []
-    bar = tqdm(total=len(prompts))
+    bar = tqdm(total=len(prompts), desc="evaluating")
     input_tokens = 0
     output_tokens = 0
     t0 = time.time()
@@ -1128,6 +1128,7 @@ def train_grpo(
     on_policy = not off_policy
     if loss_type == "grpo_clip":
         assert off_policy
+    policy = "onpolicy" if on_policy else "offpolicy"
     scheduler = CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=lr / 10)
 
     if log_name is not None:
@@ -1172,12 +1173,12 @@ def train_grpo(
                 len(train_dataset), n_prompts_per_rollout_batch, replace=False
             )
             indexes = np.repeat(indexes, group_size)
-            prompts = make_prompt(train_dataset.problem[indexes].tolist())
+            prompts = train_dataset.problem[indexes].tolist()
             solutions = train_dataset.solution[indexes].tolist()
             if log_name is None:
                 save_path = None
             else:
-                save_path = f"{log_name}-rollout{rollout_batch_size}-group{group_size}-grpo_step{n_grpo_step}.jsonl"
+                save_path = f"{log_name}-{loss_type}-{policy}-rollout{rollout_batch_size}-groupsize{group_size}-grpostep{n_grpo_step}-step{total_step}.jsonl"
             eval_result = evaluate_dataset(
                 model,
                 tokenizer,
@@ -1204,7 +1205,7 @@ def train_grpo(
             advantages = torch.Tensor(advantages).to(device).view(-1, 1)
             raw_rewards = torch.Tensor(raw_rewards).to(device).view(-1, 1)
             input_data = tokenize_prompt_and_output(
-                prompts, responses, tokenizer, device=device
+                make_prompt(prompts), responses, tokenizer, device=device
             )
             if seq_len_norm == "masked_sum":
                 normalize_constant = input_data["response_mask"].sum(-1).max()
@@ -1241,7 +1242,7 @@ def train_grpo(
                         )
                         log_probs = result["log_probs"]
                         response_mask = input_data["response_mask"][start:end]
-                        loss = grpo_microbatch_train_step(
+                        loss, _ = grpo_microbatch_train_step(
                             log_probs,
                             response_mask,
                             gradient_accumulation_steps,
@@ -1296,9 +1297,9 @@ def train_grpo(
                         # ----- log -----
                         loss = sum(losses)
                         token_entropy = sum(token_entropies)
-                        model_name = f"{log_name}-rollout{rollout_batch_size}-groupsize{group_size}-grpostep{n_grpo_step+1}-epoch{epoch+1}-step{total_step}"
+                        model_name = f"{log_name}-{loss_type}-{policy}-rollout{rollout_batch_size}-groupsize{group_size}-grpostep{n_grpo_step+1}-epoch{epoch+1}-step{total_step}"
                         tqdm.write(
-                            f"[{n_grpo_step+1}/{n_grpo_steps},{epoch+1}/{epochs_per_rollout_batch}, {step+1}/{n_microbatches_per_rollout_batch}], loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
+                            f"[{n_grpo_step+1}/{n_grpo_steps},{epoch+1}/{epochs_per_rollout_batch}, {step+1}/{n_microbatches_per_rollout_batch}],loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
                         )
                         if log_name is not None:
                             run.log(
