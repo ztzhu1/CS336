@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import time
+from timeit import default_timer
 from typing import Callable, List, Literal, Union
 from unittest.mock import patch
 
@@ -424,8 +425,7 @@ def masked_normalize(
     normalize_constant: float,
     dim: int | None = None,
 ) -> torch.Tensor:
-    tensor = torch.where(mask, tensor, 0)
-    tensor = tensor.sum(dim) / normalize_constant
+    tensor = (tensor * mask).sum(dim) / normalize_constant
     return tensor
 
 
@@ -449,14 +449,6 @@ def sft_microbatch_train_step(
     return loss, {}
 
 
-@torch.inference_mode()
-def log_generations(
-    model: PreTrainedModel, tokensizer: PreTrainedTokenizerBase, validation_data
-):
-    prompt = tokensizer.encode(validation_data)
-    model(prompt).logits
-
-
 def init_wandb(name, **config):
     run = wandb.init(
         entity="ztzhu11",
@@ -468,8 +460,8 @@ def init_wandb(name, **config):
     )
     wandb.define_metric("train_step")
     wandb.define_metric("eval_step")
-    wandb.define_metric("train/*", step_metric="train_step", summary="min")
-    wandb.define_metric("eval/*", step_metric="eval_step", summary="min")
+    wandb.define_metric("train/*", step_metric="train_step")
+    wandb.define_metric("eval/*", step_metric="eval_step")
     return run
 
 
@@ -626,9 +618,7 @@ def train(
                 input_ids = input_data.pop("input_ids")
                 labels = input_data.pop("labels")
                 response_mask = input_data.pop("response_mask")
-                with torch.autocast(
-                    device_type=str(device), dtype=torch.float16, enabled=use_amp
-                ):
+                with torch.autocast(device_type=device.type, enabled=use_amp):
                     result = get_response_log_probs(
                         model,
                         input_ids,
@@ -807,6 +797,7 @@ def compute_group_normalized_rewards(
     group_size: int,
     advantage_eps: float,
     normalize_by_std: bool,
+    rewards=None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """
     Parameters
@@ -843,16 +834,19 @@ def compute_group_normalized_rewards(
         response = rollout_responses[i : i + group_size]
         ground_truth = repeated_ground_truths[i : i + group_size]
         assert len(response) == group_size
-        rewards = []
-        for j in range(len(response)):
-            reward = reward_fn(response[j], ground_truth[j])
-            rewards.append(reward["reward"])
-        rewards = np.array(rewards)
-        _advantages = rewards - np.mean(rewards)
+        if rewards is not None:
+            _rewards = rewards[i : i + group_size]
+        else:
+            _rewards = []
+            for j in range(len(response)):
+                reward = reward_fn(response[j], ground_truth[j])
+                _rewards.append(reward["reward"])
+        _rewards = np.array(_rewards)
+        _advantages = _rewards - np.mean(_rewards)
         if normalize_by_std:
-            _advantages = _advantages / (np.std(rewards, ddof=1) + advantage_eps)
+            _advantages = _advantages / (np.std(_rewards, ddof=1) + advantage_eps)
         advantages.extend(_advantages.tolist())
-        raw_rewards.extend(rewards.tolist())
+        raw_rewards.extend(_rewards.tolist())
         i += group_size
     return advantages, raw_rewards, metadata
 
@@ -963,10 +957,9 @@ def masked_mean(
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    masked_tensor = torch.where(mask, tensor, 0)
-    sum_tensor = masked_tensor.sum(dim, keepdim=dim is not None)
+    sum_tensor = (tensor * mask).sum(dim, keepdim=dim is not None)
+    # count = mask.sum(dim, keepdim=dim is not None).clamp(min=1.0)
     count = mask.sum(dim, keepdim=dim is not None)
-    # count = torch.where(count != 0, count, torch.inf)
     mean = sum_tensor / count
     if dim is not None:
         mean = mean.squeeze(dim)
@@ -1036,6 +1029,46 @@ def grpo_microbatch_train_step(
     return pg_loss, metadata
 
 
+def log_eval_result(run, tokenizer, eval_result, advantages, total_step, t0):
+    mean_reward = eval_result.reward.mean().item()
+    mean_format_reward = eval_result.format_reward.mean().item()
+    mean_answer_reward = eval_result.answer_reward.mean().item()
+    mean_advantage = np.mean(advantages).item()
+    std_advantage = np.std(advantages, ddof=1).item()
+    token_lens = np.array(
+        list(map(len, tokenizer(eval_result.response.tolist())["input_ids"]))
+    )
+    min_token_len = token_lens.min().item()
+    max_token_len = token_lens.max().item()
+    mean_token_len = token_lens.mean().item()
+    correct_mask = (eval_result.reward > 0).to_numpy()
+    incorrect_mask = ~correct_mask
+    if np.any(correct_mask):
+        mean_correct_token_len = token_lens[correct_mask].mean().item()
+    else:
+        mean_correct_token_len = 0
+    if np.any(incorrect_mask):
+        mean_incorrect_token_len = token_lens[incorrect_mask].mean().item()
+    else:
+        mean_incorrect_token_len = 0
+    run.log(
+        {
+            "eval_step": total_step,
+            "eval/reward": mean_reward,
+            "eval/format_reward": mean_format_reward,
+            "eval/answer_reward": mean_answer_reward,
+            "eval/advantage": mean_advantage,
+            "eval/advantage_std": std_advantage,
+            "eval/token_len": mean_token_len,
+            "eval/correct_token_len": mean_correct_token_len,
+            "eval/incorrect_token_len": mean_incorrect_token_len,
+            "eval/min_token_len": min_token_len,
+            "eval/max_token_len": max_token_len,
+            "eval/time": default_timer() - t0,
+        }
+    )
+
+
 def train_grpo(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
@@ -1055,11 +1088,12 @@ def train_grpo(
     seed=3407,
     log_name=None,
     use_amp=True,
+    save=True,
 ):
     betas = (0.9, 0.95)
     weight_decay = 0.0
     max_grad_norm = 1.0
-    scaler = torch.amp.GradScaler(str(device), enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
@@ -1092,6 +1126,8 @@ def train_grpo(
         rollout_batch_size > train_batch_size
     )
     on_policy = not off_policy
+    if loss_type == "grpo_clip":
+        assert off_policy
     scheduler = CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=lr / 10)
 
     if log_name is not None:
@@ -1123,11 +1159,14 @@ def train_grpo(
         run = nullcontext()
 
     train_dataset = load_jsonl(project_dir.joinpath("data", "MATH", "train.jsonl"))
+    bar = tqdm(total=max_steps)
+    model_name = None
 
     set_random_seed(seed)
     with run:
         total_step = 0
-        for n_grpo_step in trange(n_grpo_steps, desc="grpo step"):
+        t0 = default_timer()
+        for n_grpo_step in range(n_grpo_steps):
             # ----- get rollout batch -----
             indexes = np.random.choice(
                 len(train_dataset), n_prompts_per_rollout_batch, replace=False
@@ -1149,36 +1188,51 @@ def train_grpo(
             )
             responses = eval_result.response.tolist()
             advantages, raw_rewards, _ = compute_group_normalized_rewards(
-                drgrpo_grader.r1_zero_reward_fn,
+                # drgrpo_grader.r1_zero_reward_fn,
+                None,  # don't need to compute rewards again
                 responses,
                 solutions,
                 group_size,
                 advantage_eps,
                 use_std_normalization,
+                rewards=eval_result.reward.tolist(),
             )
+            # ----- log eval_result -----
+            if log_name is not None:
+                log_eval_result(run, tokenizer, eval_result, advantages, total_step, t0)
+            # ----- train params -----
             advantages = torch.Tensor(advantages).to(device).view(-1, 1)
             raw_rewards = torch.Tensor(raw_rewards).to(device).view(-1, 1)
             input_data = tokenize_prompt_and_output(
                 prompts, responses, tokenizer, device=device
             )
-            normalize_constant = input_data["response_mask"].sum(-1).max()
+            if seq_len_norm == "masked_sum":
+                normalize_constant = input_data["response_mask"].sum(-1).max()
+            else:
+                normalize_constant = None
+            # ----- calculate old policy log probs if necessary -----
             if on_policy:
                 old_log_probs = None
             else:  # off-policy
-                old_log_probs = torch.empty_like(input_data["input_ids"])
-            updated = False
-            for epoch in trange(epochs_per_rollout_batch, desc="rollout_batch epoch"):
-                for step in trange(
-                    n_microbatches_per_rollout_batch, "rollout_batch step"
-                ):
-                    if start % train_batch_size == 0:  # new train batch
-                        losses = []
-                        token_entropies = []
+                with torch.autocast(device_type=device.type, enabled=use_amp):
+                    with torch.inference_mode():
+                        result = get_response_log_probs(
+                            model,
+                            input_data["input_ids"],
+                            input_data["labels"],
+                        )
+                        old_log_probs = result["log_probs"]
+            # ----- train -----
+            for epoch in range(epochs_per_rollout_batch):
+                for step in range(n_microbatches_per_rollout_batch):
                     start = micro_train_batch_size * step
                     end = start + micro_train_batch_size
-                    with torch.autocast(
-                        device_type=str(device), dtype=torch.float16, enabled=use_amp
-                    ):
+                    # ----- train batch starts -----
+                    if start % train_batch_size == 0:
+                        losses = []
+                        token_entropies = []
+                    # ----- forward -----
+                    with torch.autocast(device_type=device.type, enabled=use_amp):
                         result = get_response_log_probs(
                             model,
                             input_data["input_ids"][start:end],
@@ -1202,9 +1256,33 @@ def train_grpo(
                             normalize_constant=normalize_constant,
                             backward=False,
                         )
+                    # ----- backward -----
                     scaler.scale(loss).backward()
                     losses.append(loss.detach().cpu().numpy().item())
-                    if end % train_batch_size == 0:  # end train batch
+
+                    # ----- log entropy -----
+                    with torch.autocast(device_type=device.type, enabled=use_amp):
+                        with torch.inference_mode():
+                            if seq_len_norm == "masked_mean":
+                                token_entropy = masked_mean(
+                                    result["token_entropy"], response_mask, -1
+                                )
+                            else:
+                                token_entropy = masked_normalize(
+                                    result["token_entropy"],
+                                    response_mask,
+                                    normalize_constant,
+                                    -1,
+                                )
+                            token_entropy = (
+                                token_entropy.mean() / gradient_accumulation_steps
+                            )
+                            token_entropies.append(
+                                token_entropy.detach().cpu().numpy().item()
+                            )
+                    # ----- train batch ends -----
+                    if end % train_batch_size == 0:
+                        # ----- update weights -----
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             model.parameters(), max_grad_norm
@@ -1214,3 +1292,32 @@ def train_grpo(
                         optimizer.zero_grad()
                         scheduler.step()
                         total_step += 1
+                        bar.update()
+                        # ----- log -----
+                        loss = sum(losses)
+                        token_entropy = sum(token_entropies)
+                        model_name = f"{log_name}-rollout{rollout_batch_size}-groupsize{group_size}-grpostep{n_grpo_step+1}-epoch{epoch+1}-step{total_step}"
+                        tqdm.write(
+                            f"[{n_grpo_step+1}/{n_grpo_steps},{epoch+1}/{epochs_per_rollout_batch}, {step+1}/{n_microbatches_per_rollout_batch}], loss: {loss:.4f}, token_entropy: {token_entropy:.4f}"
+                        )
+                        if log_name is not None:
+                            run.log(
+                                {
+                                    "train_step": total_step,
+                                    "train/grpo_step": n_grpo_step + 1,
+                                    "train/epoch": epoch + 1,
+                                    "train/loss": loss,
+                                    "train/token_entropy": token_entropy,
+                                    "train/time": default_timer() - t0,
+                                }
+                            )
+        if log_name is not None:
+            if save and model_name is not None:
+                save_model(
+                    model,
+                    tokenizer,
+                    output_dir=project_dir / "checkpoints" / model_name,
+                )
+            run.finish()
+
+    bar.close()
