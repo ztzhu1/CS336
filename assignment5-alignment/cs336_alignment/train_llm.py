@@ -1285,11 +1285,13 @@ def train_grpo(
                     if end % train_batch_size == 0:
                         # ----- update weights -----
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
                             model.parameters(), max_grad_norm
                         )
+                        grad_norm = grad_norm.detach().cpu().numpy().item()
                         scaler.step(optimizer)
                         scaler.update()
+
                         optimizer.zero_grad()
                         scheduler.step()
                         total_step += 1
@@ -1309,6 +1311,7 @@ def train_grpo(
                                     "train/epoch": epoch + 1,
                                     "train/loss": loss,
                                     "train/token_entropy": token_entropy,
+                                    "train/grad_norm": grad_norm,
                                     "train/time": default_timer() - t0,
                                 }
                             )
