@@ -37,6 +37,12 @@ if project_path not in sys.path:
 
 with open(project_dir / "cs336_alignment" / "prompts" / "r1_zero.prompt", "r") as f:
     r1_zero_prompt = f.read()
+with open(
+    project_dir / "cs336_alignment" / "prompts" / "zero_shot_system_prompt.prompt", "r"
+) as f:
+    zero_shot_prompt = f.read()
+with open(project_dir / "cs336_alignment" / "prompts" / "alpaca_sft.prompt", "r") as f:
+    alpaca_prompt = f.read()
 
 with open(project_dir / "api_keys.json", "r") as f:
     api_keys = json.load(f)
@@ -57,13 +63,17 @@ def load_sft(max_samples=None):
 def make_prompt(
     input_text: Union[str, List[str]], prompt_type="r1_zero"
 ) -> Union[str, List[str]]:
-    if not isinstance(input_text, str):
+    if not isinstance(input_text, str) and not isinstance(input_text, tuple):
         return [make_prompt(t, prompt_type=prompt_type) for t in input_text]
 
     if prompt_type == "r1_zero":
         return r1_zero_prompt.format(question=input_text)
+    elif prompt_type == "zero_shot":
+        return zero_shot_prompt.format(instruction=input_text)
+    elif prompt_type == "alpaca":
+        return alpaca_prompt.format(instruction=input_text[0], response=input_text[1])
     else:
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
 def make_sft_dataset(batch_size=1, indexes=None):
@@ -1330,3 +1340,112 @@ def train_grpo(
             run.finish()
 
     bar.close()
+
+
+# ----- RLHF -----
+class SFTDataset(Dataset):
+    def __init__(self, tokenizer, dataset_path, seq_length, shuffle):
+        self.tokenizer = tokenizer
+        self.dataset_path = dataset_path
+        df = load_jsonl(dataset_path)
+        if shuffle:
+            df = df.sample(frac=1)
+        self.seq_length = seq_length
+        self.shuffle = shuffle
+        ids = []
+        for i in range(len(df)):
+            prompt = df.prompt.iloc[i]
+            response = df.response.iloc[i]
+            full_text = make_prompt((prompt, response), "alpaca")
+            if i != len(df) - 1:
+                full_text = full_text + tokenizer.eos_token
+            ids.extend(tokenizer(full_text).input_ids)
+        batch_size = (len(ids) + 1) // seq_length
+        self.dataset = torch.empty((batch_size, seq_length), dtype=torch.long)
+        self.labels = torch.empty((batch_size, seq_length), dtype=torch.long)
+        for i in range(batch_size):
+            self.dataset[i] = torch.Tensor(ids[i * seq_length : (i + 1) * seq_length])
+            self.labels[i] = torch.Tensor(
+                ids[i * seq_length + 1 : (i + 1) * seq_length + 1]
+            )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        if i >= len(self):
+            raise StopIteration
+        return {"input_ids": self.dataset[i], "labels": self.labels[i]}
+
+
+def iterate_batches(dataset: Dataset, batch_size: int, shuffle: bool):
+    """
+    Given a PyTorch Dataset, return an iterable over batches of size `batch_size`.
+    Iterating through the returned iterable should constitute one epoch over the Dataset.
+
+    Args:
+        dataset: Dataset
+            Dataset to emit batches from.
+        batch_size: int
+            Number of examples to include per batch.
+        shuffle: bool
+            If true, shuffle examples before batching them.
+
+    Returns:
+        Iterable over batches, where each batch has size `batch_size`.
+    """
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+def compute_per_instance_dpo_loss(
+    lm: torch.nn.Module,
+    lm_ref: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    beta: float,
+    prompt: str,
+    response_chosen: str,
+    response_rejected: str,
+) -> torch.Tensor:
+    """
+    Given two language models (`lm`, and the "reference model" `lm_ref`),
+    their tokenizer, the DPO beta hyperparameter, a prompt and a pair
+    of responses to the prompt, computes the value of the DPO loss for this example.
+
+    lm: torch.nn.Module
+        Language model being trained.
+    lm_ref: torch.nn.Module
+        Reference language model.
+    tokenizer: PreTrainedTokenizerBase
+        Tokenizer for both language models.
+    beta: float
+        DPO beta hyperparameter.
+    prompt: str
+        Prompt for this instance of preference pair.
+    response_chosen: str
+        Preferred response to the prompt.
+    response_rejected: str
+        Rejected response to the prompt.
+
+    Returns:
+        torch.Tensor with the DPO loss for this example.
+    """
+    text_w = make_prompt((prompt, response_chosen + tokenizer.eos_token), "alpaca")
+    text_l = make_prompt((prompt, response_rejected + tokenizer.eos_token), "alpaca")
+    tokens_w = tokenizer(text_w, return_tensors="pt").input_ids
+    tokens_l = tokenizer(text_l, return_tensors="pt").input_ids
+    log_probs_w = get_response_log_probs(lm, tokens_w[:, :-1], tokens_w[:, 1:])[
+        "log_probs"
+    ]
+    log_probs_l = get_response_log_probs(lm, tokens_l[:, :-1], tokens_l[:, 1:])[
+        "log_probs"
+    ]
+    log_probs_w_ref = get_response_log_probs(lm_ref, tokens_w[:, :-1], tokens_w[:, 1:])[
+        "log_probs"
+    ]
+    log_probs_l_ref = get_response_log_probs(lm_ref, tokens_l[:, :-1], tokens_l[:, 1:])[
+        "log_probs"
+    ]
+    log_probs = log_probs_w - log_probs_w_ref - (log_probs_l - log_probs_l_ref)
+    log_probs = log_probs.sum(-1)
+    loss = -torch.log(torch.nn.functional.sigmoid(beta * log_probs))
+    return loss.mean()
