@@ -39,7 +39,7 @@ def test_DistributedDataParallelCPU(bucket_size_mb, model_class):
     bucket_size_mb 0.01 is designed to test the case with 1 buckets (containing
     3 parameter tensors).
     """
-    world_size = 2
+    world_size = 4
     mp.spawn(
         _test_DistributedDataParallelCPU,
         args=(world_size, bucket_size_mb, model_class),

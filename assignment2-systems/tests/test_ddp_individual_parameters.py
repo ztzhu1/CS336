@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 @pytest.mark.parametrize("model_class", [ToyModel, ToyModelWithTiedWeights])
 def test_DistributedDataParallelIndividualParameters(model_class):
-    world_size = 2
+    world_size = 4
     mp.spawn(
         _test_DistributedDataParallelIndividualParameters,
         args=(world_size, model_class),
