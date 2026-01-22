@@ -51,14 +51,18 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
-def get_chunks(file_name, desired_num_chunks=4, return_first=False):
+def get_chunks(file_name, desired_num_chunks=4, return_first=False, index=None):
     chunks = []
+    if index is not None:
+        return_first = True
     with open(file_name, "rb") as f:
         boundaries = find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
 
         # The following is a serial implementation, but you can parallelize this
         # by sending each start/end pair to a set of processes.
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
+        for i, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+            if index is not None and i != index:
+                continue
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore")
             chunks.append(chunk)

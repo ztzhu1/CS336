@@ -1,4 +1,5 @@
-from collections import Counter
+from contextlib import nullcontext
+from collections import Counter, defaultdict
 from functools import partial
 from multiprocessing import Pool
 import os
@@ -6,7 +7,7 @@ import pickle
 from typing import Iterable, Iterator, Optional
 
 import numpy as np
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
 import regex as re
 
@@ -15,33 +16,51 @@ from .pretokenization_example import get_chunks
 # ----- train bpe -----
 
 
-def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], cpp=False):
+def train_bpe(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str]=["<|endoftext|>"],
+    cpp=False,
+    use_mp=True,
+    num_chunks=100,
+):
     """
-    It takes 3G memory, 7 min (pretokenization 76 s, merging 340 s) to train TinyStoriesV2-GPT4-train.txt.
+    It takes 8G memory, 66 s (pretokenization 6 s, merging 60 s) to train TinyStoriesV2-GPT4-train.txt.
     The longest tokens are ' accomplishment', ' disappointment' and ' responsibility'
 
-    It takes 100G memory, 70 h (pretokenization 2 min, merging 70 h) to train owt_train.txt.
+    It takes 100G memory, 14 h (pretokenization 100 s, merging 14 h) to train owt_train.txt.
     """
-    chunks = get_chunks(input_path, desired_num_chunks=100)
+    chunks = get_chunks(input_path, desired_num_chunks=num_chunks)
     freq_table = Counter()
-    num_cpus = os.cpu_count()
+    num_cpus = min(os.cpu_count(), len(chunks))
     if cpp:
+        raise Exception("C++ merge is not supported in the new version.")
         merge_func = merge_cpp
     else:
         merge_func = merge
     # pretokenization
-    with Pool(processes=num_cpus) as pool:
+    if use_mp:
+        context = Pool(processes=num_cpus)
+    else:
+        context = nullcontext()
+    with context as pool:
         args = []
         for i in range(len(chunks)):
             args.append((chunks[i], special_tokens))
-        for result in tqdm(
-            pool.imap_unordered(get_freq_table, args),
-            total=len(args),
-            desc="getting freq_table",
-        ):
-            freq_table.update(result)
+        if use_mp:
+            for result in tqdm(
+                pool.imap_unordered(get_freq_table, args),
+                total=len(args),
+                desc="getting freq_table",
+            ):
+                freq_table.update(result)
+        else:
+            for arg in tqdm(args, total=len(args), desc="getting freq_table"):
+                freq_table.update(get_freq_table(arg))
 
-        byte_pairs, pair_relations = pair_bytes(freq_table, progress_bar=True)
+        byte_pairs, pair_relations, pair_to_keys, key_to_pairs = pair_bytes(
+            freq_table, progress_bar=True
+        )
 
         vocab = []
         for s in special_tokens:
@@ -52,13 +71,13 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], cpp=F
         bar = tqdm(total=vocab_size, desc="merging")
         bar.update(len(vocab))
         while len(vocab) < vocab_size and len(byte_pairs) > 0:
-            freq_table, byte_pairs, pair_relations, merge_key = merge_func(
-                freq_table, byte_pairs, pair_relations
+            byte_pairs, pair_relations, merge_pair = merge_func(
+                freq_table, byte_pairs, pair_relations, pair_to_keys, key_to_pairs
             )
 
-            assert merge_key not in vocab
-            vocab.append(merge_key)
-            merged_pair = pair_relations[merge_key]
+            assert merge_pair not in vocab
+            vocab.append(merge_pair)
+            merged_pair = pair_relations[merge_pair]
             merges.append(merged_pair)
             bar.update()
         bar.close()
@@ -110,40 +129,34 @@ def get_freq_table(args, return_words=False):
 def pair_bytes(freq_table, progress_bar=False):
     byte_pairs = Counter()
     pair_relations = {}
+    pair_to_keys = defaultdict(set)
+    key_to_pairs = defaultdict(set)
     it = freq_table.items()
     if progress_bar:
         it = tqdm(it, desc="pairing bytes")
     for k, v in it:
         if len(k) > 1:
             for i in range(len(k) - 1):
-                key = k[i] + k[i + 1]
-                byte_pairs[key] += v
-                if key in pair_relations:
-                    assert pair_relations[key] == (k[i], k[i + 1])
+                pair = k[i] + k[i + 1]
+                byte_pairs[pair] += v
+                pair_to_keys[pair].add(k)
+                key_to_pairs[k].add(pair)
+                if pair in pair_relations:
+                    assert pair_relations[pair] == (k[i], k[i + 1])
                 else:
-                    pair_relations[key] = (k[i], k[i + 1])
-    return byte_pairs, pair_relations
+                    pair_relations[pair] = (k[i], k[i + 1])
+    return byte_pairs, pair_relations, pair_to_keys, key_to_pairs
 
 
-def merge(freq_table, byte_pairs, pair_relations):
-    keys = np.array(list(byte_pairs))
-    values = np.array(list(byte_pairs.values()))
-    indexes = np.where(values == values.max())[0]
-    max_keys = keys[indexes]
-    max_pairs = [pair_relations[k] for k in max_keys]
-    max_pair = max(max_pairs)
-    index = max_pairs.index(max_pair)
-    merge_key = max_keys[index]
-    new_freq_table = {}
-    for key in list(freq_table):
+def merge(freq_table, byte_pairs, pair_relations, pair_to_keys, key_to_pairs):
+    merge_pair = max(byte_pairs, key=lambda k: (byte_pairs[k], pair_relations[k]))
+    keys = pair_to_keys.pop(merge_pair)
+    # print("\nold ft:", dict(freq_table))
+    for key in keys:
         new_key = []
         skip_next = False
         merge_last = False
-        value = freq_table[key]
-        joined_key = b"".join(key)
-        if merge_key not in joined_key:
-            new_freq_table[key] = freq_table[key]
-            continue
+        value = freq_table.pop(key)
         for i in range(len(key)):
             if skip_next:
                 skip_next = False
@@ -152,7 +165,7 @@ def merge(freq_table, byte_pairs, pair_relations):
                 new_key.append(key[i])
                 break
             pair = key[i] + key[i + 1]
-            if pair == merge_key:
+            if pair == merge_pair:
                 new_key.append(pair)
                 if i > 0:
                     if not merge_last:
@@ -167,7 +180,7 @@ def merge(freq_table, byte_pairs, pair_relations):
                         pair_relations[new_pair] = (left, pair)
                     byte_pairs[new_pair] += value
                 if i < len(key) - 2:
-                    if i == len(key) - 3 or key[i + 2] + key[i + 3] != merge_key:
+                    if i == len(key) - 3 or key[i + 2] + key[i + 3] != merge_pair:
                         merge_next = False
                         right = key[i + 2]
                     else:
@@ -192,20 +205,27 @@ def merge(freq_table, byte_pairs, pair_relations):
                 new_key.append(key[i])
                 skip_next = False
                 merge_last = False
-        new_freq_table[tuple(new_key)] = freq_table[key]
+        new_key = tuple(new_key)
+        freq_table[new_key] = value
+        pair_to_keys[merge_pair].add(new_key)
+        pairs = key_to_pairs.pop(key)
+        for pair in pairs:
+            pair_to_keys[pair].discard(key)
+        for j in range(len(new_key) - 1):
+            pair = new_key[j] + new_key[j + 1]
+            pair_to_keys[pair].add(new_key)
+            key_to_pairs[new_key].add(pair)
     for key in list(byte_pairs):
-        if key == merge_key:
+        if key == merge_pair:
             byte_pairs.pop(key)
             continue
         assert byte_pairs[key] >= 0
         if byte_pairs[key] == 0:
             byte_pairs.pop(key)
-    # print()
-    # print("count:", dict(byte_pairs), merge_key)
-    # print("old ft:", dict(freq_table))
-    # print("new ft:", dict(new_freq_table))
+    # print("count:", dict(byte_pairs), merge_pair)
+    # print("new ft:", dict(freq_table))
     # print("--")
-    return new_freq_table, byte_pairs, pair_relations, merge_key
+    return byte_pairs, pair_relations, merge_pair
 
 
 def merge_cpp(freq_table, byte_pairs, pair_relations):
